@@ -27,25 +27,20 @@ println("Building symbolic stochastic model...")
 # ============================================================================
 # Gaussian Noises
 const σ_additive =  0.01       # Additive Gaussian noise strength
-const σ_multiplicative = 0.1   # Multiplicative Gaussian noise strength
+const σ_multiplicative = 0.5   # Multiplicative Gaussian noise strength
 
 # Jump noise parameters
 const λ_jump = 0.01                   # Jump rate (jumps per unit time)
-const μ_jump = 0.0                   # Mean jump size
+const μ_jump = 0.0                    # Mean jump size
 const σ_jump = 1e-4                   # Jump size standard deviation
 
 # Colored noise (Ornstein-Uhlenbeck)
-const τ_ou = 5.0                      # Time constant for OU process
-const σ_ou = 0.2                      # OU noise strength
-const k_ou = 0.5                      # Start with a small coupling strength
-
-# Non-Gaussian noise parameters
-const α_levy = 1.5                   # Lévy stability parameter (1 < α ≤ 2)
-const β_levy = 0.0                   # Lévy skewness parameter (-1 ≤ β ≤ 1)
-const σ_levy = 0.05                  # Lévy scale parameter
+const τ_ou = 5.0                       # Time constant for OU process
+const k_ou = 1e-3                      # OU noise coefficient
+const σ_ou = 1e-3                      # OU noise strength
 
 # State-dependent noise
-const σ_calcium = 0.1                # Noise strength for calcium-dependent noise
+const σ_calcium = 0.5                # Noise strength for calcium-dependent noise
 
 
 # ============================================================================
@@ -173,25 +168,11 @@ function build_stochastic_model(noise_type::Symbol)
         Jpdhfs(t)
     end
     
-    # @brownians B  
+    @brownians B  # Definie Brownian Motion
     # ============================================================================
     # FLUX EQUATIONS (same as original)
     # ============================================================================
     
-    # Base Jerout without noise
-    Jerout_base = ((vip3 * ((ip3^2.0)/((ip3^2.0)+(kip3^2.0))) * 
-                    ((cac^2.0)/((cac^2.0)+(kcaa^2.0))) *
-                    ((kcai1^4.0)/((kcai2^4.0)+(cac^4.0)))) + vleak) * 
-                    (caer - cac) / uMmM
-    
-    # Define Jerout based on noise type (deterministic part)
-    if noise_type == :colored
-        @variables η(t) 
-        Jerout_eq = Jerout ~ Jerout_base + k_ou * η  # Add OU noise term
-    else
-        Jerout_eq = Jerout ~ Jerout_base
-    end
-
     flux_eqs = [
         #Glucose Transporter - Jglctr - (Berndt et al., 2015)
         Jglctr ~ ((V_mf_glut*(GLCex/k_glc_glut))-(V_mr_glut*(Gluc/k_glc_glut)))/(1.0 + (GLCex/k_glc_glut) + (Gluc/k_glc_glut))
@@ -263,9 +244,8 @@ function build_stochastic_model(noise_type::Symbol)
             ( (1.0 + alphac * atpc * exp(-fant * psi / RTF) / adpc) * (1. + adpm / (alpham * atpm)) )
         
         # ER/IP3R (TO ADD NOISE IN Jerout)
-        # Jerout ~ ((vip3 * ((ip3^2.0)/((ip3^2.0)+(kip3^2.0))) * ((cac^2.0)/((cac^2.0)+(kcaa^2.0))) *
-        #         ((kcai1^4.0)/((kcai2^4.0)+(cac^4.0)))) + vleak) * (caer - cac) / uMmM
-        Jerout_eq
+        Jerout ~ ((vip3 * ((ip3^2.0)/((ip3^2.0)+(kip3^2.0))) * ((cac^2.0)/((cac^2.0)+(kcaa^2.0))) *
+                ((kcai1^4.0)/((kcai2^4.0)+(cac^4.0)))) + vleak) * (caer - cac) / uMmM
 
         # NCX + SERCA 
         Jncx   ~ vncx * (cam / cac) * exp(b * (psi - psiStar) / RTF) / ((1. + kna / nac)^n * (1. + kca / cam))
@@ -312,24 +292,26 @@ function build_stochastic_model(noise_type::Symbol)
     d_caer_base = uMmM*deltaer*(Jserca - Jerout)
     d_cac_base = uMmM*fc*(-Jserca + Jerout + delta * (Jncx - Juni))  
 
-    if noise_type == :none
+    if noise_type in [:none, :jump] 
         d_caer_eq = D(caer) ~ d_caer_base
         d_cac_eq = D(cac) ~ d_cac_base
-        
-    # elseif noise_type == :additive
-    #     d_caer_eq = D(caer) ~ d_caer_base + (-σ_additive * B)
-    #     d_cac_eq = D(cac) ~ d_cac_base + (σ_additive * B)
+    elseif noise_type == :colored
+        @variables η(t)        
+        d_caer_eq = D(caer) ~ d_caer_base + (- k_ou * η)
+        d_cac_eq = D(cac) ~ d_cac_base + (k_ou * η)
+    elseif noise_type == :additive
+        d_caer_eq = D(caer) ~ d_caer_base + (-σ_additive * B)
+        d_cac_eq = D(cac) ~ d_cac_base + (σ_additive * B)
 
-    # elseif noise_type == :multiplicative
+    elseif noise_type == :multiplicative
 
-    #     d_caer_eq = D(caer) ~ d_caer_base + (-σ_multiplicative * Jerout * B)
-    #     d_cac_eq = D(cac) ~ d_cac_base + (σ_multiplicative * Jerout * B)
-    # elseif noise_type == :state_dependent
-    #     d_caer_eq = D(caer) ~ d_caer_base + (-σ_calcium * sqrt(abs(Jerout)) * B)
-    #     d_cac_eq = D(cac) ~ d_cac_base + (σ_calcium * sqrt(abs(Jerout)) * B)
+        d_caer_eq = D(caer) ~ d_caer_base + (-σ_multiplicative * Jerout * B)
+        d_cac_eq = D(cac) ~ d_cac_base + (σ_multiplicative * Jerout * B)
+    elseif noise_type == :state_dependent
+        d_caer_eq = D(caer) ~ d_caer_base + (-σ_calcium * sqrt(abs(Jerout)) * B)
+        d_cac_eq = D(cac) ~ d_cac_base + (σ_calcium * sqrt(abs(Jerout)) * B)
     else        
-        d_caer_eq = D(caer) ~ d_caer_base
-        d_cac_eq = D(cac) ~ d_cac_base
+        error("Unsupported noise type: $noise_type")
     end
 
     diff_eqs = [
@@ -365,78 +347,10 @@ function build_stochastic_model(noise_type::Symbol)
             D(F6P) ~ Jgpi  - Jpfks  - Jpfk2 + Jf26b                            #F6P
             D(G6P) ~ Jhxs - Jgpi                                               #G6P
             D(Gluc) ~ Jglctrs - Jhxs                                            #Gluc
-        ]
-    
+        ]    
         
-    if noise_type in [:colored, :mixed]        
-        push!(diff_eqs, D(η) ~ -η/τ_ou)  # Deterministic part of OU process
-    end
-
-    # ============================================================================
-    # NOISE EQUATIONS (g function in SDE: dX = f(X)dt + g(X)dW)
-    # ============================================================================
-    
-    n_flux_eqs = length(flux_eqs)
-    n_diff_eqs = length(diff_eqs)
-    n_total = n_flux_eqs + n_diff_eqs    
-    
-    caer_idx_ori = findfirst(eq -> occursin("caer", string(eq.lhs)), diff_eqs)
-    cac_idx_ori = findfirst(eq -> occursin("cac", string(eq.lhs)), diff_eqs)
-    # Find the index of caer equation (which uses Jerout)
-    caer_idx = n_flux_eqs + caer_idx_ori
-    cac_idx = n_flux_eqs + cac_idx_ori
-    
-    println("DEBUG: n_flux_eqs = $n_flux_eqs, n_diff_eqs = $n_diff_eqs, n_total = $n_total")
-    println("DEBUG: caer relative index = $caer_idx_ori, absolute = $caer_idx")
-    println("DEBUG: cac relative index = $cac_idx_ori, absolute = $cac_idx")
-    # Decide number of independent Wiener processes for each noise type
-    n_wieners = 0
-    if noise_type == :none || noise_type == :jump
-        n_wieners = 0
-    elseif noise_type == :additive
-        n_wieners = 2   # explicit independent noises for caer and cac
-    elseif noise_type == :multiplicative || noise_type == :state_dependent
-        n_wieners = 1   # one Wiener that couples caer/cac via Jerout-based amplitude
-    elseif noise_type == :colored
-        # W1 → caer/cac coupling, W2 → OU process η
-        n_wieners = 2
-    else
-        error("Unknown noise type: $noise_type")
-    end
-
-    # Create correct-sized Num matrix (n_total rows × n_wieners cols)
-    noiseeqs = zeros(Num, n_total, n_wieners)
-
-    if noise_type in [:none, :jump]
-        # No noise: g(X) = 0
-    elseif noise_type == :colored
-        # For colored noise, we have 2 Wiener processes:
-        # W2 drives the OU process
-        # W1 → caer/cac (coupling factor k_ou controls how strongly OU couples to the flux)
-        # W2 → η (OU internal driving noise)
-        eta_idx = n_total  # assuming you placed η last in u0 / diff_eqs when colored
-        noiseeqs[caer_idx, 1] = -σ_ou * η
-        noiseeqs[cac_idx, 1]  =  k_ou * η
-        noiseeqs[eta_idx,   2] = σ_ou
-
-    elseif noise_type == :additive
-        # For other noise types, we have 2 independent Wiener processes
-        # W1 for caer, W2 for cac
-        noiseeqs[caer_idx, 1] = -σ_additive
-        noiseeqs[cac_idx, 2]  =  σ_additive
-    elseif noise_type == :multiplicative
-        # Jerout is an algebraic variable; the simplifier will substitute it.
-        noiseeqs[caer_idx, 1] = -σ_multiplicative * caer
-        noiseeqs[cac_idx, 1]  = σ_multiplicative * cac
-    elseif noise_type == :state_dependent
-        # State-dependent noise: √|Jerout|
-        # Use gradient and a different scaling
-        gradient = abs(caer - cac)
-        noiseeqs[caer_idx, 1] = -σ_calcium * sqrt(gradient)
-        noiseeqs[cac_idx, 1]  = σ_calcium * sqrt(gradient)
-    else
-        error("Unknown noise type: $noise_type. Choose from: :none, :additive, " *
-            ":multiplicative, :colored, :state_dependent, :mixed, :jump")
+    if noise_type in [:colored]        
+        push!(diff_eqs, D(η) ~ -η/τ_ou + σ_ou * B)  
     end
 
     # ============================================================================
@@ -491,7 +405,7 @@ function build_stochastic_model(noise_type::Symbol)
     # Combine all equations
     all_eqs = vcat(flux_eqs, diff_eqs)
 
-    return all_eqs, noiseeqs, u0, caer_idx_ori, cac_idx_ori
+    return all_eqs, u0
 end
 
 const var_names = ["adpc", "adpm", "akg", "atpc", "atpm",
@@ -502,7 +416,7 @@ const var_names = ["adpc", "adpm", "akg", "atpc", "atpm",
                    "GAP", "DHAP", "F16B", "F6P", "G6P", "Gluc"]
 
 
-function simulate_model(noise_type::Symbol; tspan=(0.0, 4000.0), use_symbolic::Bool=true)
+function simulate_model(noise_type::Symbol; tspan=(0.0, 4000.0))
     println("\n" * "="^80)
     println("SIMULATING MODEL WITH NOISE TYPE: $noise_type")
     println("="^80)
@@ -515,130 +429,59 @@ function simulate_model(noise_type::Symbol; tspan=(0.0, 4000.0), use_symbolic::B
     current_seed = get(seeds, noise_type, 1111)
     Random.seed!(current_seed)
     println("USING RANDOM SEED: $current_seed")
-    println("USING symbolic: $use_symbolic")
 
     # Build symbolic model
-    all_eqs, noiseeqs, u0, caer_idx, cac_idx = build_stochastic_model(noise_type)
-    println("The Caer equation index is: $caer_idx",
-            " and the Cac equation index is: $cac_idx")
-    println("Noise matrix size: ", size(noiseeqs))
-    nz = count(!iszero, noiseeqs)
-    println("Number of nonzero entries in noiseeqs: $nz")
+    all_eqs, u0 = build_stochastic_model(noise_type)
 
     # Create system
     if noise_type in [:none, :jump] # ,
         println("Solving ODE system...") 
         @named sys_raw = ODESystem(all_eqs, t)
         sys = structural_simplify(sys_raw)  
-    elseif noise_type in [:additive, :multiplicative, :state_dependent] 
-        if !use_symbolic 
-            println("Using diffusion function...")
-            @named sys_raw = ODESystem(all_eqs, t)
-            sys = structural_simplify(sys_raw, )  
-        else
-            println("Using brownian motion...")
-            @mtkcompile sys_raw = System(all_eqs, t)
-            
-        end
+    elseif noise_type in [:additive, :multiplicative, :state_dependent, :colored] 
+        println("Using brownian motion...")
+        @mtkcompile sys_raw = System(all_eqs, t)
     else
-        println("Using symbolic SDE system...")
-        @named sys_ode = ODESystem(all_eqs, t)
-        @named sys_raw = SDESystem(sys_ode, noiseeqs)
-        sys = structural_simplify(sys_raw)  
+        error("Unknown noise type: $noise_type")
     end
     
-    caeridx = findfirst(eq -> occursin("Differential(t)(caer", string(eq.lhs)), equations(sys_raw))
-    cacidx = findfirst(eq -> occursin("Differential(t)(cac", string(eq.lhs)), equations(sys_raw))            
-    println("DEBUG $noise_type: Caer is defined as $(equations(sys_raw)[caeridx])")
-    println("DEBUG $noise_type: Cac is defined as $(equations(sys_raw)[cacidx])")
+    caer_idx = findfirst(eq -> occursin("Differential(t)(caer", string(eq.lhs)), equations(sys_raw))
+    cac_idx = findfirst(eq -> occursin("Differential(t)(cac", string(eq.lhs)), equations(sys_raw))            
+    println("DEBUG $noise_type: Caer with index $caer_idx is defined as $(equations(sys_raw)[caer_idx])")
+    println("DEBUG $noise_type: Cac with index $cac_idx is defined as $(equations(sys_raw)[cac_idx])")
     # Solve
     if noise_type == :none
         println("Solving deterministic ODE...")
         prob = ODEProblem(sys, u0, tspan)
         sol = solve(prob; reltol=1e-6, abstol=1e-9)
     elseif noise_type == :additive 
-        if use_symbolic
-            prob = SDEProblem(sys_raw, u0, tspan)
-            sol = solve(prob, SOSRI(), adaptive=true, saveat=1.0,
-                        reltol=1e-4, abstol=1e-6, maxiters=10^7,
-                        seed=current_seed,
-                        isoutofdomain=(u,p,t) -> any(isnan.(u)) || any(u .< 0))
-        else
-            function noise_func_additive!(du, u, p, t)
-                # u: Current state vector (all your variables at time t)
-                # du: Noise/diffusion matrix to be filled (OUTPUT)
-                # Size: (n_states × n_wiener_processes)
-                # p: Parameters (constants like kip3, vip3, etc.)
-                # t: Current time
-                fill!(du, 0.0)
-                # Two independent Wiener processes
-                du[caer_idx, 1] = -σ_additive
-                du[cac_idx, 2] = σ_additive
-            end
-            
-            prob = ODEProblem(sys, u0, tspan)
-            noise_rate_prototype = zeros(length(u0), 2)  # 1 Wiener processes
-            sde_prob = SDEProblem(prob.f, noise_func_additive!, prob.u0, prob.tspan, prob.p;
-                                noise_rate_prototype=noise_rate_prototype)
-            sol = solve(sde_prob, LambaEM(), dt=0.5, adaptive=true, saveat=1.0,
-                        seed=current_seed,
-                        isoutofdomain=(u,p,t) -> any(isnan.(u)) || any(u .< 0))
-        end
+        prob = SDEProblem(sys_raw, u0, tspan)
+        sol = solve(prob, ImplicitRKMil(), adaptive=true, saveat=1.0,
+                    reltol=1e-4, abstol=1e-6, maxiters=10^7,
+                    seed=current_seed,
+                    isoutofdomain=(u,p,t) -> any(isnan.(u)) || any(u .< 0))
+        
     elseif noise_type == :multiplicative 
-        if use_symbolic
-            prob = SDEProblem(sys_raw, u0, tspan)
-            sol = solve(prob, ImplicitRKMil(), adaptive=true, saveat=1.0,
-                        reltol=1e-4, abstol=1e-6, maxiters=10^7,
-                        seed=current_seed,
-                        isoutofdomain=(u,p,t) -> any(isnan.(u)) || any(u .< 0))
-        else
-            
-            # Need to calculate Jerout from current state
-            function noise_func_mult!(du, u, p, t)
-                fill!(du, 0.0)
-                # Extract caer and cac from state 
-                cac = max(u[cac_idx], 1e-10)
-                caer = max(u[caer_idx], 1e-10)
-
-                du[caer_idx, 1] = -σ_multiplicative * caer
-                du[cac_idx, 1] = σ_multiplicative * cac
-            end
-            
-            prob = ODEProblem(sys, u0, tspan)
-            noise_rate_prototype = zeros(length(u0), 1)  # 1 Wiener process
-            sde_prob = SDEProblem(prob.f, noise_func_mult!, prob.u0, prob.tspan, prob.p;
-                                noise_rate_prototype=noise_rate_prototype)
-            sol = solve(sde_prob, LambaEulerHeun(), dt=0.5, adaptive=false, saveat=1.0,
-                        seed=current_seed,
-                        isoutofdomain=(u,p,t) -> any(isnan.(u)) || any(u .< 0))
-        end
+        prob = SDEProblem(sys_raw, u0, tspan)
+        sol = solve(prob, ImplicitRKMil(), adaptive=true, saveat=1.0,
+                    reltol=1e-4, abstol=1e-6, maxiters=10^7,
+                    seed=current_seed,
+                    isoutofdomain=(u,p,t) -> any(isnan.(u)) || any(u .< 0))
+    
     elseif noise_type == :state_dependent 
-        if use_symbolic
-            prob = SDEProblem(sys_raw, u0, tspan)
-            sol = solve(prob, ImplicitRKMil(), adaptive=true, saveat=1.0,
-                        reltol=1e-4, abstol=1e-6, maxiters=10^7,
-                        seed=current_seed,
-                        isoutofdomain=(u,p,t) -> any(isnan.(u)) || any(u .< 0))
-        else            
-            function noise_func_state!(du, u, p, t)  
-                fill!(du, 0.0)
-                cac = max(u[cac_idx], 1e-10)
-                caer = max(u[caer_idx], 1e-10)
-                gradient = abs(caer - cac)
-                amplitude = σ_calcium * sqrt(max(gradient, 1e-10))  # Prevent sqrt of negative
-                
-                du[caer_idx, 1] = -amplitude
-                du[cac_idx, 1] = amplitude
-            end
-            
-            prob = ODEProblem(sys, u0, tspan)
-            noise_rate_prototype = zeros(length(u0), 1)
-            sde_prob = SDEProblem(prob.f, noise_func_state!, prob.u0, prob.tspan, prob.p;
-                                noise_rate_prototype=noise_rate_prototype)
-            sol = solve(sde_prob, LambaEulerHeun(), dt=0.5, adaptive=false, saveat=1.0,
-                        seed=current_seed,
-                        isoutofdomain=(u,p,t) -> any(isnan.(u)) || any(u .< 0))
-        end
+        
+        prob = SDEProblem(sys_raw, u0, tspan)
+        sol = solve(prob, ImplicitRKMil(), adaptive=true, saveat=1.0,
+                    reltol=1e-4, abstol=1e-6, maxiters=10^7,
+                    seed=current_seed,
+                    isoutofdomain=(u,p,t) -> any(isnan.(u)) || any(u .< 0))
+
+    elseif noise_type == :colored
+        prob = SDEProblem(sys_raw, u0, tspan)
+        sol = solve(prob, ISSEM(), adaptive=true, saveat=1.0,
+                    reltol=1e-5, abstol=1e-8, maxiters=10^7,
+                    seed=current_seed,
+                    isoutofdomain=(u,p,t) -> any(isnan.(u)) || any(u .< 0))
     elseif noise_type == :jump
         println("Solving stochastic SDE...")
         prob = ODEProblem(sys, u0, tspan)
@@ -656,11 +499,7 @@ function simulate_model(noise_type::Symbol; tspan=(0.0, 4000.0), use_symbolic::B
         sol = solve(jump_prob, CVODE_BDF(); saveat=1.0, 
                     isoutofdomain=(u,p,t) -> any(isnan.(u)) || any(u .< 0))
     else        
-        println("Solving stochastic SDE...")
-        prob = SDEProblem(sys, u0, tspan)
-        sol = solve(prob, ImplicitRKMil(), adaptive=true, saveat=1.0,
-                    reltol=1e-4, abstol=1e-6, seed=current_seed,
-                    isoutofdomain=(u,p,t) -> any(isnan.(u)) || any(u .< 0))
+        error("Unknown noise type: $noise_type")
     end
     
     println("Simulation complete!")
@@ -992,7 +831,7 @@ noise_types_symbolic = [:none, :additive, :multiplicative, :colored, :state_depe
 results = Dict()
 
 for noise_type in noise_types_symbolic
-    sol, vnames = simulate_model(noise_type; tspan=(0.0, 4000.0), use_symbolic=true)
+    sol, vnames = simulate_model(noise_type; tspan=(0.0, 4000.0))
     results[noise_type] = (sol, vnames)
     
     plot_results(sol, vnames, noise_type)
@@ -1000,25 +839,6 @@ for noise_type in noise_types_symbolic
     
     println("\n✅ Successfully completed: $noise_type\n")
 end
-
-# Second, run with diffusion functions (more control but requires careful tuning)
-# println("\n" * "="^80)
-# println("METHOD 2: Using diffusion functions (custom noise_func!)")
-# println("="^80)
-
-# noise_types_diffusion = [:additive, :multiplicative, :state_dependent]
-# results_diffusion = Dict()
-
-# for noise_type in noise_types_diffusion
-#     sol, vnames = simulate_model(noise_type; tspan=(0.0, 4000.0), use_symbolic=false)
-#     results_diffusion[noise_type] = (sol, vnames)
-    
-#     # Save with different suffix to distinguish
-#     plot_results(sol, vnames, Symbol(string(noise_type) * "_diffusion"))
-#     save_results(sol, vnames, Symbol(string(noise_type) * "_diffusion"))
-    
-#     println("\n✅ Successfully completed (diffusion): $noise_type\n")
-# end
 
 # Compare all results
 compare_noise_types(results, var_names)
@@ -1238,8 +1058,7 @@ for nt in types
 end
 
 if !isempty(plots)
-    p_compare = plot(plots..., layout=(length(plots), 1), size=(1200, 900),
-                     title="Comparison of Noise Types (CaER)")
+    p_compare = plot(plots..., layout=(length(plots), 1), size=(1200, 900))
     mkpath("imgs/bio/symbolic/")
     savefig(p_compare, "imgs/bio/symbolic/noise_type_comparison.png")
     println("Saved: imgs/bio/symbolic/noise_type_comparison.png")
