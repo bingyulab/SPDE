@@ -10,7 +10,7 @@ atot = 3                        # = atpc + adpc (mM)                            
 ckint = 1                       # = cit + isoc + akg + scoa + suc + fum + mal + oaa (mM)                (Cortassa et al., 2003)
 nadtot = 0.8                    # = nadm + nadhm (mM)                                                   (Voorslujis et al., 2024)
 
-const ip3 = 0.7                 # mM IP3 concentration in cytosol (0.5-1 mM)                            (Voorslujis et al., 2024)
+# const ip3 = 0.7                 # mM IP3 concentration in cytosol (0.5-1 mM)                            (Voorslujis et al., 2024)
 const F26B = 0.05               # mM                                                                    (Mulukutla et al., 2015)
 const GLCex= 25.0               # mM Glucose concentration in the extracellular space (5-25 mM) 
 const glutm = 0.8               # mM 

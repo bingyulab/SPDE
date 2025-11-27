@@ -1,7 +1,7 @@
 ## Model of Central Metabolic Pathway:  Glycolisis + TCA + ER Calcium crosstalk
 # Author : Ingrid LIZCANO PRADA, Bingyu JIANG
 # Last update : 10/27/2025
-# import Pkg; Pkg.add("Random")
+# import Pkg; Pkg.add("JumpProcesses")
 using Random
 using Timers
 using ModelingToolkit
@@ -15,33 +15,32 @@ using CSV
 using StatsPlots
 using Sundials
 
-
 tic()
 
 include("parameters.jl")
 
 println("Building symbolic stochastic model...")
 
+# 1. additive parameters with 0.5 strength ✅ unstable, too large
+# 2. state-dependent and multiply parameters with 0.5 strength ✅
+# 3. jump process ✅
+# 4. modify ip3 from 0-2.
+# 5. remove colored noise ✅
+# 6. Caer, cac, atpc, adpc, psi, pyrm plot in the figures. ✅
+
 # ============================================================================
 # NOISE PARAMETERS (adjust these for different noise strengths)
 # ============================================================================
+noise_list = [:none, :additive, :multiplicative, :state_dependent, :jump]
+colors = [:black, :blue, :red, :green, :purple, :orange]
+important_variables = ["caer", "cac", "atpc", "adpc", "psi", "pyrm"]
+
 # Gaussian Noises
-const σ_additive =  0.01       # Additive Gaussian noise strength
+const σ_additive =  0.05       # Additive Gaussian noise strength, 0.5, 0.1 are unstatble
 const σ_multiplicative = 0.5   # Multiplicative Gaussian noise strength
-
-# Jump noise parameters
-const λ_jump = 0.01                   # Jump rate (jumps per unit time)
-const μ_jump = 0.0                    # Mean jump size
-const σ_jump = 1e-4                   # Jump size standard deviation
-
-# Colored noise (Ornstein-Uhlenbeck)
-const τ_ou = 5.0                       # Time constant for OU process
-const k_ou = 1e-3                      # OU noise coefficient
-const σ_ou = 1e-3                      # OU noise strength
-
-# State-dependent noise
-const σ_calcium = 0.5                # Noise strength for calcium-dependent noise
-
+const σ_calcium = 0.5          # State-dependent noise:Noise strength for calcium-dependent noise
+const λ_jump = 0.01            # Jump rate (jumps per unit time)
+const σ_jump = 0.01            # Jump size
 
 # ============================================================================
 # BUILD SYMBOLIC MODEL WITH NOISE OPTIONS
@@ -54,7 +53,6 @@ function build_stochastic_model(noise_type::Symbol)
     - :none          - Deterministic (no noise)
     - :additive      - Additive Gaussian noise on Jerout
     - :multiplicative - Multiplicative noise on Jerout  
-    - :colored       - Ornstein-Uhlenbeck colored noise
     - :calcium       - State-dependent noise on calcium fluxes
     """
     
@@ -167,7 +165,8 @@ function build_stochastic_model(noise_type::Symbol)
         Jhyds(t)
         Jpdhfs(t)
     end
-    
+    # Define ip3 as a symbolic parameter for optimization/scanning
+    @parameters ip3
     @brownians B  # Definie Brownian Motion
     # ============================================================================
     # FLUX EQUATIONS (same as original)
@@ -246,7 +245,7 @@ function build_stochastic_model(noise_type::Symbol)
         # ER/IP3R (TO ADD NOISE IN Jerout)
         Jerout ~ ((vip3 * ((ip3^2.0)/((ip3^2.0)+(kip3^2.0))) * ((cac^2.0)/((cac^2.0)+(kcaa^2.0))) *
                 ((kcai1^4.0)/((kcai2^4.0)+(cac^4.0)))) + vleak) * (caer - cac) / uMmM
-
+        
         # NCX + SERCA 
         Jncx   ~ vncx * (cam / cac) * exp(b * (psi - psiStar) / RTF) / ((1. + kna / nac)^n * (1. + kca / cam))
         Jserca ~ vserca * (cac^2. / (kserca^2. + cac^2.)) * (atpc / (atpc + katpc))
@@ -295,10 +294,10 @@ function build_stochastic_model(noise_type::Symbol)
     if noise_type in [:none, :jump] 
         d_caer_eq = D(caer) ~ d_caer_base
         d_cac_eq = D(cac) ~ d_cac_base
-    elseif noise_type == :colored
-        @variables η(t)        
-        d_caer_eq = D(caer) ~ d_caer_base + (- k_ou * η)
-        d_cac_eq = D(cac) ~ d_cac_base + (k_ou * η)
+    # elseif noise_type == :colored
+    #     @variables η(t)        
+    #     d_caer_eq = D(caer) ~ d_caer_base + (- k_ou * η)
+    #     d_cac_eq = D(cac) ~ d_cac_base + (k_ou * η)
     elseif noise_type == :additive
         d_caer_eq = D(caer) ~ d_caer_base + (-σ_additive * B)
         d_cac_eq = D(cac) ~ d_cac_base + (σ_additive * B)
@@ -349,9 +348,9 @@ function build_stochastic_model(noise_type::Symbol)
             D(Gluc) ~ Jglctrs - Jhxs                                            #Gluc
         ]    
         
-    if noise_type in [:colored]        
-        push!(diff_eqs, D(η) ~ -η/τ_ou + σ_ou * B)  
-    end
+    # if noise_type in [:colored]        
+    #     push!(diff_eqs, D(η) ~ -η/τ_ou + σ_ou * B)  
+    # end
 
     # ============================================================================
     # INITIAL CONDITIONS (moved here to be in scope of symbolic variables)
@@ -398,14 +397,14 @@ function build_stochastic_model(noise_type::Symbol)
         GAP => GAP0,    DHAP => DHAP0,    F16B => F16B0,    F6P => F6P0,    G6P => G6P0,   Gluc => Gluc0
     )
 
-    if noise_type == :colored
-        u0[η] = 0.0
-    end
+    # if noise_type == :colored
+    #     u0[η] = 0.0
+    # end
 
     # Combine all equations
     all_eqs = vcat(flux_eqs, diff_eqs)
 
-    return all_eqs, u0
+    return all_eqs, u0, ip3
 end
 
 const var_names = ["adpc", "adpm", "akg", "atpc", "atpm",
@@ -416,7 +415,7 @@ const var_names = ["adpc", "adpm", "akg", "atpc", "atpm",
                    "GAP", "DHAP", "F16B", "F6P", "G6P", "Gluc"]
 
 
-function simulate_model(noise_type::Symbol; tspan=(0.0, 4000.0))
+function simulate_model(noise_type::Symbol; tspan=(0.0, 4000.0), ip3_val=0.7)
     println("\n" * "="^80)
     println("SIMULATING MODEL WITH NOISE TYPE: $noise_type")
     println("="^80)
@@ -431,14 +430,14 @@ function simulate_model(noise_type::Symbol; tspan=(0.0, 4000.0))
     println("USING RANDOM SEED: $current_seed")
 
     # Build symbolic model
-    all_eqs, u0 = build_stochastic_model(noise_type)
+    all_eqs, u0, ip3_param = build_stochastic_model(noise_type)
 
     # Create system
     if noise_type in [:none, :jump] # ,
         println("Solving ODE system...") 
         @named sys_raw = ODESystem(all_eqs, t)
-        sys = structural_simplify(sys_raw)  
-    elseif noise_type in [:additive, :multiplicative, :state_dependent, :colored] 
+        sys_raw = structural_simplify(sys_raw)  
+    elseif noise_type in [:additive, :multiplicative, :state_dependent]
         println("Using brownian motion...")
         @mtkcompile sys_raw = System(all_eqs, t)
     else
@@ -449,10 +448,13 @@ function simulate_model(noise_type::Symbol; tspan=(0.0, 4000.0))
     cac_idx = findfirst(eq -> occursin("Differential(t)(cac", string(eq.lhs)), equations(sys_raw))            
     println("DEBUG $noise_type: Caer with index $caer_idx is defined as $(equations(sys_raw)[caer_idx])")
     println("DEBUG $noise_type: Cac with index $cac_idx is defined as $(equations(sys_raw)[cac_idx])")
+    
+    u0 = merge(u0, Dict(ip3_param => ip3_val))
+
     # Solve
     if noise_type == :none
         println("Solving deterministic ODE...")
-        prob = ODEProblem(sys, u0, tspan)
+        prob = ODEProblem(sys_raw, u0, tspan)
         sol = solve(prob; reltol=1e-6, abstol=1e-9)
     elseif noise_type == :additive 
         prob = SDEProblem(sys_raw, u0, tspan)
@@ -475,7 +477,6 @@ function simulate_model(noise_type::Symbol; tspan=(0.0, 4000.0))
                     reltol=1e-4, abstol=1e-6, maxiters=10^7,
                     seed=current_seed,
                     isoutofdomain=(u,p,t) -> any(isnan.(u)) || any(u .< 0))
-
     elseif noise_type == :colored
         prob = SDEProblem(sys_raw, u0, tspan)
         sol = solve(prob, ISSEM(), adaptive=true, saveat=1.0,
@@ -483,20 +484,24 @@ function simulate_model(noise_type::Symbol; tspan=(0.0, 4000.0))
                     seed=current_seed,
                     isoutofdomain=(u,p,t) -> any(isnan.(u)) || any(u .< 0))
     elseif noise_type == :jump
-        println("Solving stochastic SDE...")
-        prob = ODEProblem(sys, u0, tspan)
-        
+        println("Solving Jump SDE...")
+
+        prob = ODEProblem(sys_raw, u0, tspan)
+        # prob = SDEProblem(sys_raw, u0, tspan)
         # Define jump process
-        rate(u, p, t) = λ_jump  # Constant jump rate
-        affect!(integrator) = begin
+        rate1(u, p, t) = u[caer_idx] * λ_jump  
+        rate2(u, p, t) = u[cac_idx] * λ_jump  
+        function affect!(integrator) 
             # Add random jump to caer
-            integrator.u[caer_idx] -= μ_jump + σ_jump * randn()
-            integrator.u[cac_idx]  += μ_jump + σ_jump * randn()
+            integrator.u[caer_idx]  += σ_jump
+            integrator.u[cac_idx] -= σ_jump
+            nothing
         end
-        
-        jump = ConstantRateJump(rate, affect!)
-        jump_prob = JumpProblem(prob, Direct(), jump)
-        sol = solve(jump_prob, CVODE_BDF(); saveat=1.0, 
+
+        jump1 = ConstantRateJump(rate1, affect!)
+        jump2 = ConstantRateJump(rate2, affect!)
+        jump_prob = JumpProblem(prob, Direct(), jump1, jump2)
+        sol = solve(jump_prob, Rodas5P(); saveat=1.0, 
                     isoutofdomain=(u,p,t) -> any(isnan.(u)) || any(u .< 0))
     else        
         error("Unknown noise type: $noise_type")
@@ -626,8 +631,7 @@ function plot_results(sol, var_names, noise_type)
     println("Saved: imgs/bio/symbolic/all_variables_$(noise_type).png")
     
     # Plot key variables
-    key_vars = ["cac", "atpc", "adpc", "psi", "nadhm", "pyrm"]
-    key_indices = [df_find_column(dsol_window, v) for v in key_vars]
+    key_indices = [df_find_column(dsol_window, v) for v in important_variables]
 
     plots_key = []
     for idx in key_indices
@@ -725,13 +729,14 @@ function compare_noise_types(results, var_names)
     caer_name = "caer"
     cac_name  = "cac"   
     
-    # Create subplots for each noise type
-    noise_types = [:none, :additive, :multiplicative, :state_dependent, :colored, :jump]
-    
+    # Create subplots for each noise type    
     plots_caer = []
     plots_cac = []
     
-    for nt in noise_types
+    for nt in noise_list
+        if nt == :none
+            continue  # Skip deterministic for this comparison
+        end
         if haskey(results, nt)
             sol, _ = results[nt]
             dsol = DataFrame(sol)
@@ -764,9 +769,9 @@ function compare_noise_types(results, var_names)
             push!(plots_cac, p_cac)
         end
     end
-    
-    p_caer_combined = plot(plots_caer..., layout=(3, 2), size=(1400, 900))
-    p_cac_combined = plot(plots_cac..., layout=(3, 2), size=(1400, 900))
+    cnt = ceil(Int, (length(noise_list)-1)/2)
+    p_caer_combined = plot(plots_caer..., layout=(cnt, 2), size=(1400, 900))
+    p_cac_combined = plot(plots_cac..., layout=(cnt, 2), size=(1400, 900))
     
     mkpath("imgs/bio/symbolic/")
     savefig(p_caer_combined, "imgs/bio/symbolic/comparison_caer_all_noise.png")
@@ -781,10 +786,8 @@ function compare_noise_types(results, var_names)
     p_overlay_cac = plot(xlabel="Time (s)", ylabel="CaC (μM)",
                          title="CaC Comparison - All Noise Types", 
                          legend=:topright, size=(1000, 600))
-    
-    colors = [:black, :blue, :red, :green, :purple, :orange]
-    
-    for (i, nt) in enumerate(noise_types)
+        
+    for (i, nt) in enumerate(noise_list)
         if haskey(results, nt)
             sol, _ = results[nt]
             dsol = DataFrame(sol)
@@ -822,16 +825,28 @@ println("\n" * "="^80)
 println("SYMBOLIC STOCHASTIC METABOLIC MODEL")
 println("="^80 * "\n")
 
-# First, run with symbolic noise matrices (default, most stable)
 println("\n" * "="^80)
-println("METHOD 1: Using symbolic noise matrices (noiseeqs)")
+println("Using Brownian Motion Noise Implementation")
 println("="^80)
 
-noise_types_symbolic = [:none, :additive, :multiplicative, :colored, :state_dependent, :jump]
 results = Dict()
 
-for noise_type in noise_types_symbolic
-    sol, vnames = simulate_model(noise_type; tspan=(0.0, 4000.0))
+for noise_type in noise_list
+    # Time the solve
+    t_start = time()
+    
+    # Solve with current IP3 value
+    sol, vnames = simulate_model(noise_type; tspan=(0.0, 4000.0))    
+    t_solve = time() - t_start
+    
+    # Check convergence
+    converged = (Symbol(sol.retcode) == :Success || Symbol(sol.retcode) == :Default) 
+    final_t = sol.t[end]
+    n_steps = length(sol.t)
+    
+    status_icon = converged ? "✓" : "⚠️"
+    println("$status_icon Simulation $(sol.retcode): $(round(t_solve, digits=2))s, $n_steps steps, final t=$(round(final_t, digits=1))")
+    
     results[noise_type] = (sol, vnames)
     
     plot_results(sol, vnames, noise_type)
@@ -842,14 +857,6 @@ end
 
 # Compare all results
 compare_noise_types(results, var_names)
-
-# If diffusion method worked, compare those too
-# if length(results_diffusion) > 0
-#     println("\n" * "="^80)
-#     println("Comparison: Diffusion Function Method")
-#     println("="^80)
-#     compare_noise_types(results_diffusion, var_names)
-# end
 
 println("\n" * "="^80)
 println("ALL SIMULATIONS COMPLETE!")
@@ -883,7 +890,7 @@ end
 # Compare the three noise types
 noise_comparison = Dict()
 
-for nt in [:none, :additive, :multiplicative, :state_dependent, :colored, :jump]
+for nt in noise_list
     if haskey(results, nt)
         sol, vn = results[nt]
         df = DataFrame(sol)
@@ -940,11 +947,10 @@ println("\n" * "-"^80)
 println("PAIRWISE COMPARISONS:")
 println("-"^80)
 
-types = [:none, :additive, :multiplicative, :state_dependent, :colored, :jump]
 all_identical = true
 
 # Use a non-constant local name to avoid clashing with any existing `n`
-N = length(types)
+N = length(noise_list)
 corrmat = fill(NaN, N, N)
 maemat  = fill(NaN, N, N)
 
@@ -952,7 +958,7 @@ for i in 1:N
     corrmat[i,i] = 1.0
     maemat[i,i]  = 0.0
     for j in (i+1):N
-        nt1, nt2 = types[i], types[j]
+        nt1, nt2 = noise_list[i], noise_list[j]
         if haskey(noise_comparison, nt1) && haskey(noise_comparison, nt2)
             d1 = noise_comparison[nt1][:caer_data]
             d2 = noise_comparison[nt2][:caer_data]
@@ -985,16 +991,16 @@ end
 # Nicely print matrices
 using Printf
 
-println("\nPairwise Correlation matrix (rows/cols = $(join(string.(types), ", ")))")
+println("\nPairwise Correlation matrix (rows/cols = $(join(string.(noise_list), ", ")))")
 # header
 print(rpad("", 18))
-for t in types
+for t in noise_list
     print(rpad(string(t), 12))
 end
 println()
 # rows
 for i in 1:N
-    print(rpad(string(types[i]), 18))
+    print(rpad(string(noise_list[i]), 18))
     for j in 1:N
         v = corrmat[i,j]
         if isnan(v)
@@ -1008,12 +1014,12 @@ end
 
 println("\nPairwise Mean Absolute Error (MAE) matrix (same ordering):")
 print(rpad("", 18))
-for t in types
+for t in noise_list
     print(rpad(string(t), 12))
 end
 println()
 for i in 1:N
-    print(rpad(string(types[i]), 18))
+    print(rpad(string(noise_list[i]), 18))
     for j in 1:N
         v = maemat[i,j]
         if isnan(v)
@@ -1037,7 +1043,7 @@ println("\nCreating comparison visualization...")
 
 # Build stacked comparison plots per-noise (safe column lookup per DataFrame)
 plots = []
-for nt in types
+for nt in noise_list
     if haskey(results, nt)
         sol, _ = results[nt]
         df = DataFrame(sol)
@@ -1070,9 +1076,8 @@ end
 p_overlay = plot(xlabel="Time (s)", ylabel="CaER (μM)",
                  title="All Noise Types Overlaid", legend=:topright, size=(1200, 600))
 
-colors = [:blue, :red, :green]
 ci = 1
-for nt in types
+for nt in noise_list
     if haskey(results, nt)
         sol, _ = results[nt]
         df = DataFrame(sol)
@@ -1109,7 +1114,7 @@ if all_identical
     println("DEBUG: Checking noise matrix structure")
     println("="^80)
     
-    for nt in types
+    for nt in noise_list
         println("\nRebuilding $nt to check noise matrix...")
         all_eqs, noiseeqs, u0 = build_stochastic_model(nt)
         
@@ -1128,3 +1133,242 @@ if all_identical
         end
     end
 end
+
+# ============================================================================
+# NEW FUNCTION: Scan IP3 and Plot Differences
+# ============================================================================
+
+function scan_ip3_experiment()
+    println("\n" * "="^80)
+    println("RUNNING IP3 SCAN (0.1 - 2.0) FOR ALL NOISE TYPES")
+    println("="^80)
+
+    target_noise_types = [:none, :additive, :multiplicative, :state_dependent, :jump]
+    ip3_values = 0.1:0.2:2.0
+    
+    # Store results: Dict[NoiseType -> DataFrame]
+    results_all = Dict()
+    diagnostics = Dict()
+
+    for noise_type in target_noise_types
+        println("\nProcessing $noise_type...")
+        
+        # Initialize DataFrame with String column names
+        df_res = DataFrame()
+        df_res[!, "ip3"] = Float64[]
+        for v in important_variables
+            df_res[!, v] = Float64[]
+        end
+        
+        # Diagnostics storage
+        diag = Dict(
+            :converged => Int[],
+            :final_time => Float64[],
+            :n_steps => Int[],
+            :solve_time => Float64[]
+        )
+        
+        # Loop IP3
+        for val in ip3_values
+            print("  IP3 = $val : ")
+            
+            # Time the solve
+            t_start = time()
+            
+            try
+                # Solve with current IP3 value
+                sol, _ = simulate_model(noise_type; tspan=(0.0, 4000.0), ip3_val=val)
+                
+                t_solve = time() - t_start
+                
+                # Check convergence
+                converged = (Symbol(sol.retcode) == :Success || Symbol(sol.retcode) == :Default) ? 1 : 0
+                final_t = sol.t[end]
+                n_steps = length(sol.t)
+                
+                push!(diag[:converged], converged)
+                push!(diag[:final_time], final_t)
+                push!(diag[:n_steps], n_steps)
+                push!(diag[:solve_time], t_solve)
+                
+                println("✓ ($(round(t_solve, digits=2))s, $n_steps steps, status=$(sol.retcode))")
+                
+                # Convert to DataFrame
+                df_sol = DataFrame(sol)
+                n_rows = nrow(df_sol)
+                
+                println("    DEBUG: DataFrame has $n_rows rows, $(ncol(df_sol)) columns")
+                println("    DEBUG: Column names: $(names(df_sol)[1:min(5, ncol(df_sol))])...")
+                
+                # Calculate steady state (last 20% of trajectory)
+                if n_rows > 50 && converged == 1  # Increased threshold for safety
+                    start_idx = floor(Int, n_rows * 0.8)
+                    row_data = Dict{String, Float64}("ip3" => val)
+                    
+                    n_found = 0
+                    n_missing = 0
+                    
+                    for var in important_variables
+                        col_idx = df_find_column(df_sol, var)
+                        if !isnothing(col_idx)
+                            data_segment = df_sol[start_idx:end, col_idx]
+                            valid_data = filter(!isnan, data_segment)
+                            if length(valid_data) > 0
+                                row_data[var] = mean(valid_data)
+                                n_found += 1
+                            else
+                                row_data[var] = NaN
+                                n_missing += 1
+                            end
+                        else
+                            println("    WARNING: Could not find column for '$var'")
+                            row_data[var] = NaN
+                            n_missing += 1
+                        end
+                    end
+                    
+                    println("    ✓ Extracted: $n_found/$n_missing variables found/missing")
+                    push!(df_res, row_data)
+                    
+                else
+                    println("    ⚠️  Insufficient data: n_rows=$n_rows, converged=$converged")
+                    fallback_row = Dict{String, Float64}("ip3" => val)
+                    for v in important_variables
+                        fallback_row[v] = NaN
+                    end
+                    push!(df_res, fallback_row)
+                end
+                
+            catch e
+                println("    ❌ ERROR: $e")
+                t_solve = time() - t_start
+                
+                # Record failure
+                push!(diag[:converged], 0)
+                push!(diag[:final_time], 0.0)
+                push!(diag[:n_steps], 0)
+                push!(diag[:solve_time], t_solve)
+                
+                # Add NaN row
+                fallback_row = Dict{String, Float64}("ip3" => val)
+                for v in important_variables
+                    fallback_row[v] = NaN
+                end
+                push!(df_res, fallback_row)
+            end
+        end
+        
+        results_all[noise_type] = df_res
+        diagnostics[noise_type] = diag
+        
+        # Print summary statistics
+        println("\n  Summary for $noise_type:")
+        println("    Convergence rate: $(sum(diag[:converged]))/$(length(diag[:converged]))")
+        if length(diag[:solve_time]) > 0
+            println("    Avg solve time: $(round(mean(diag[:solve_time]), digits=2))s")
+            println("    Avg steps: $(round(mean(filter(x -> x > 0, diag[:n_steps])), digits=0))")
+        end
+    end
+
+    # Print detailed diagnostics
+    println("\n" * "="^80)
+    println("DETAILED DIAGNOSTICS")
+    println("="^80)
+    
+    for (nt, diag) in diagnostics
+        println("\n$nt:")
+        n_converged = sum(diag[:converged])
+        n_total = length(diag[:converged])
+        println("  Convergence: $n_converged/$n_total successful")
+        
+        if n_converged > 0
+            successful_times = diag[:solve_time][diag[:converged] .== 1]
+            successful_steps = diag[:n_steps][diag[:converged] .== 1]
+            
+            println("  Solve time: min=$(round(minimum(successful_times), digits=2))s, " *
+                    "max=$(round(maximum(successful_times), digits=2))s, " *
+                    "mean=$(round(mean(successful_times), digits=2))s")
+            println("  Steps: min=$(minimum(successful_steps)), " *
+                    "max=$(maximum(successful_steps)), " *
+                    "mean=$(round(mean(successful_steps), digits=0))")
+            
+            # Check stability
+            successful_finals = diag[:final_time][diag[:converged] .== 1]
+            stable = all(successful_finals .>= 3900.0)
+            println("  Stability: $(stable ? "✓ All reached t=4000" : "⚠️  Some terminated early")")
+            if !stable
+                early_indices = findall((diag[:final_time] .< 3900.0) .& (diag[:converged] .== 1))
+                println("    Early terminations at IP3 = $(ip3_values[early_indices])")
+            end
+        else
+            println("  ⚠️  No successful runs to analyze")
+        end
+    end
+
+    # Plotting Comparison (rest remains the same)
+    println("\n" * "="^80)
+    println("GENERATING COMPARISON PLOTS")
+    println("="^80)
+    mkpath("imgs/bio/scan/")
+    
+    for var in important_variables
+        p = plot(xlabel="IP3 (μM)", ylabel="$var (steady state)", 
+                 title="Steady State $var vs IP3", 
+                 legend=:outertopright, size=(800, 600))
+        
+        color_map = Dict(
+            :none => :black,
+            :additive => :blue,
+            :multiplicative => :red,
+            :state_dependent => :green,
+            :jump => :purple
+        )
+        
+        for (nt, df) in results_all
+            if nrow(df) > 0 && var in names(df)
+                valid_idx = .!isnan.(df[!, var])
+                if sum(valid_idx) > 0
+                    plot!(p, df[!, "ip3"][valid_idx], df[!, var][valid_idx], 
+                          label=string(nt), 
+                          marker=:circle, 
+                          markersize=5,
+                          linewidth=2,
+                          color=get(color_map, nt, :auto))
+                end
+            end
+        end
+        
+        savefig(p, "imgs/bio/scan/compare_$(var)_ip3.png")
+        println("Saved: imgs/bio/scan/compare_$(var)_ip3.png")
+    end
+    
+    # Combined plot
+    println("\nCreating combined overview plot...")
+    plots_combined = []
+    for var in important_variables
+        p = plot(xlabel="IP3 (μM)", ylabel=var, title=var, legend=false, size=(400, 300))
+        for (nt, df) in results_all
+            if nrow(df) > 0 && var in names(df)
+                valid_idx = .!isnan.(df[!, var])
+                if sum(valid_idx) > 0
+                    plot!(p, df[!, "ip3"][valid_idx], df[!, var][valid_idx], 
+                          linewidth=2, marker=:circle, markersize=3)
+                end
+            end
+        end
+        push!(plots_combined, p)
+    end
+    
+    p_all = plot(plots_combined..., layout=(2, 3), size=(1400, 800))
+    savefig(p_all, "imgs/bio/scan/all_variables_overview.png")
+    println("Saved: imgs/bio/scan/all_variables_overview.png")
+    
+    println("\n" * "="^80)
+    println("IP3 SCAN COMPLETE")
+    println("="^80)
+    
+    return results_all, diagnostics
+end
+
+# Run the experiment
+scan_results, scan_diagnostics = scan_ip3_experiment()
