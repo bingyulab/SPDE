@@ -55,6 +55,58 @@ function calculate_atp_adp_ratio(df::DataFrame, n_points::Int=1000)
 end
 
 """
+Detect complete oscillation cycles (escape events) using dual threshold crossing.
+An escape event is: 
+  1. Start below low_threshold (25th percentile)
+  2. Cross above high_threshold (75th percentile) 
+  3. Return below low_threshold (complete cycle)
+Returns indices of cycle completions (when signal returns to baseline).
+"""
+function detect_escape_events(data::Vector{Float64}; 
+                              low_percentile::Float64=25.0,
+                              high_percentile::Float64=75.0)
+    n = length(data)
+    if n < 10
+        return Int[]
+    end
+    
+    # Dual thresholds
+    low_threshold = quantile(data, low_percentile / 100.0)
+    high_threshold = quantile(data, high_percentile / 100.0)
+    
+    escape_times = Int[]
+    
+    # State machine: 0 = at baseline, 1 = rising (crossed low), 2 = at peak (crossed high)
+    state = 0
+    
+    for i in 2:n
+        if state == 0
+            # At baseline, waiting to cross low threshold upward
+            if data[i] > low_threshold && data[i-1] <= low_threshold
+                state = 1  # Started rising
+            end
+        elseif state == 1
+            # Rising, waiting to cross high threshold
+            if data[i] > high_threshold && data[i-1] <= high_threshold
+                state = 2  # Reached peak region
+            elseif data[i] < low_threshold && data[i-1] >= low_threshold
+                # Fell back before reaching peak - reset
+                state = 0
+            end
+        elseif state == 2
+            # At peak, waiting to return to baseline
+            if data[i] < low_threshold && data[i-1] >= low_threshold
+                # Completed full cycle!
+                push!(escape_times, i)
+                state = 0  # Ready for next cycle
+            end
+        end
+    end
+    
+    return escape_times
+end
+
+"""
 Detect peaks/spikes in a time series using local maxima
 """
 function detect_peaks(data::Vector{Float64}; threshold_percentile::Float64=75.0)
@@ -162,8 +214,22 @@ Calculate Kramers escape rate from ISI distribution
 Escape rate λ = 1/⟨τ⟩ where τ is waiting time
 """
 function calculate_escape_rate(isi::Vector{Float64})
-    if length(isi) < 2
-        return NaN
-    end
     return 1.0 / mean(isi)
+end
+
+"""
+Calculate escape rate with error estimate from multiple runs
+Returns (mean_rate, std_rate)
+"""
+function calculate_escape_rate_with_error(isi_samples::Vector{Vector{Float64}})
+    rates = Float64[]
+    for isi in isi_samples
+        if length(isi) > 2
+            push!(rates, 1.0 / mean(isi))
+        end
+    end
+    if length(rates) == 0
+        return NaN, NaN
+    end
+    return mean(rates), std(rates)
 end

@@ -1,7 +1,7 @@
 ## Model of Central Metabolic Pathway:  Glycolisis + TCA + ER Calcium crosstalk
 # Author : Ingrid LIZCANO PRADA, Bingyu JIANG
 # Last update : 10/27/2025
-# import Pkg; Pkg.add("JumpProcesses")
+# import Pkg; Pkg.add("Distributions")
 using Random
 using Timers
 using ModelingToolkit
@@ -15,6 +15,8 @@ using CSV
 using StatsPlots
 using Sundials
 using FFTW  # Add this import for frequency analysis
+using Printf
+using Distributions
 
 tic()
 # 1. noise strength , mean(ATP:ADP ratio)
@@ -27,6 +29,10 @@ include("helper.jl")
 
 println("Building symbolic stochastic model...")
 
+# 1. ATP:ADP ratio add mean in the figure.
+# 2. add deterministic plot for kramers
+# 3. remove Figure 11 & 12.
+
 # ============================================================================
 # Global settings
 # ============================================================================
@@ -36,10 +42,11 @@ color_map = Dict(:none => :black, :additive => :blue,
                  :multiplicative => :red, :state_dependent => :green, 
                  :jump => :purple)
 important_variables = ["caer", "cac", "atpc", "adpc", "psi", "pyrm"]
-seeds = Dict(
+seed_dict = Dict(
         :none => 1111, :additive => 1234, :multiplicative => 5678,
-        :state_dependent => 9012, :colored => 3456
+        :state_dependent => 9012, :jump => 3456
     )
+    
 # ============================================================================
 # BUILD SYMBOLIC MODEL WITH NOISE OPTIONS
 # ============================================================================
@@ -422,16 +429,16 @@ function simulate_model(
         σ_calcium = 0.5,  
         λ_jump = 0.01,             # Jump rate (jumps per unit time)
         σ_jump = 0.01,             # Jump size
+        seeds = seed_dict,
     )
     println("\n" * "="^80)
     println("SIMULATING MODEL WITH NOISE TYPE: $noise_type")
     println("="^80)
     
-    # CRITICAL FIX: Use different random seed for each noise type    
+    # Use different random seed for each noise type   
     current_seed = get(seeds, noise_type, 1111)
     Random.seed!(current_seed)
     println("USING RANDOM SEED: $current_seed")
-
     # Build symbolic model
     all_eqs, u0, ip3_param = build_stochastic_model(noise_type,
                                                     σ_additive,
@@ -452,8 +459,8 @@ function simulate_model(
     
     caer_idx = findfirst(eq -> occursin("Differential(t)(caer", string(eq.lhs)), equations(sys_raw))
     cac_idx = findfirst(eq -> occursin("Differential(t)(cac", string(eq.lhs)), equations(sys_raw))            
-    println("DEBUG $noise_type: Caer with index $caer_idx is defined as $(equations(sys_raw)[caer_idx])")
-    println("DEBUG $noise_type: Cac with index $cac_idx is defined as $(equations(sys_raw)[cac_idx])")
+    # println("DEBUG $noise_type: Caer with index $caer_idx is defined as $(equations(sys_raw)[caer_idx])")
+    # println("DEBUG $noise_type: Cac with index $cac_idx is defined as $(equations(sys_raw)[cac_idx])")
     
     u0 = merge(u0, Dict(ip3_param => ip3_val))
 
@@ -461,7 +468,7 @@ function simulate_model(
     if noise_type == :none
         println("Solving deterministic ODE...")
         prob = ODEProblem(sys_raw, u0, tspan)
-        sol = solve(prob; reltol=1e-6, abstol=1e-9)
+        sol = solve(prob; reltol=1e-6, abstol=1e-9, saveat=1.0)
     elseif noise_type == :additive 
         prob = SDEProblem(sys_raw, u0, tspan)
         sol = solve(prob, ImplicitRKMil(), adaptive=true, saveat=1.0,
@@ -814,65 +821,12 @@ function compare_noise_types(results, var_names)
 end
 
 # ============================================================================
-# MAIN EXECUTION
-# ============================================================================
-
-println("\n" * "="^80)
-println("SYMBOLIC STOCHASTIC METABOLIC MODEL")
-println("="^80 * "\n")
-
-println("\n" * "="^80)
-println("Using Brownian Motion Noise Implementation")
-println("="^80)
-
-results = Dict()
-
-for noise_type in noise_list
-    # Time the solve
-    t_start = time()
-    
-    # Solve with current IP3 value
-    sol, vnames = simulate_model(noise_type; tspan=(0.0, 4000.0))    
-    t_solve = time() - t_start
-    
-    # Check convergence
-    converged = (Symbol(sol.retcode) == :Success || Symbol(sol.retcode) == :Default) 
-    final_t = sol.t[end]
-    n_steps = length(sol.t)
-    
-    status_icon = converged ? "✓" : "⚠️"
-    println("$status_icon Simulation $(sol.retcode): $(round(t_solve, digits=2))s, $n_steps steps, final t=$(round(final_t, digits=1))")
-    
-    results[noise_type] = (sol, vnames)
-    
-    plot_results(sol, vnames, noise_type)
-    save_results(sol, vnames, noise_type)
-    
-    println("\n✅ Successfully completed: $noise_type\n")
-end
-
-# Compare all results
-compare_noise_types(results, var_names)
-
-println("\n" * "="^80)
-println("ALL SIMULATIONS COMPLETE!")
-println("="^80)
-println("\nResults saved in:")
-println("  - imgs/bio/symbolic/")
-println("  - results/symbolic/")
-toc() 
-
-verify_noise_differences(results)
-
-# ============================================================================
 # This will verify that the noise types are actually different
 # ============================================================================
 
 println("\n" * "="^80)
 println("DETAILED VERIFICATION OF NOISE DIFFERENCES")
 println("="^80)
-
-using Statistics
 
 # Function to calculate power spectral density
 function simple_psd(data, dt=1.0)
@@ -883,153 +837,241 @@ function simple_psd(data, dt=1.0)
     return freqs[1:n÷2], fft_result[1:n÷2]
 end
 
-# Compare the three noise types
-noise_comparison = Dict()
-
-for nt in noise_list
-    if haskey(results, nt)
-        sol, vn = results[nt]
-        df = DataFrame(sol)
-        
-        # FIX: Check if we have enough data points
-        if nrow(df) < 100
-            println("⚠️  Warning: $nt has only $(nrow(df)) points, skipping comparison")
-            continue
-        end
-        
-        dsol_window = filter(:timestamp => t -> t ≥ (maximum(df.timestamp) - 1000), df)
-        caer_idx = df_find_column(dsol_window, "caer")
-        cac_idx = df_find_column(dsol_window, "cac")
-        
-        if !isnothing(caer_idx) && !isnothing(cac_idx)
-            # FIX: Safe indexing - take last available points
-            n_points = min(1000, nrow(df))
-            start_idx = max(1, nrow(df) - n_points + 1)
-
-            caer_data = df[start_idx:end, caer_idx]
-            cac_data = df[start_idx:end, cac_idx]
+"""
+Compare noise types by extracting statistics from simulation results.
+Returns a Dict mapping noise_type => statistics dict.
+"""
+function build_noise_comparison(results, noise_list)
+    noise_comparison = Dict()
+    
+    for nt in noise_list
+        if haskey(results, nt)
+            sol, vn = results[nt]
+            df = DataFrame(sol)
             
-            # Filter out NaN/Inf values
-            valid_mask = isfinite.(caer_data) .& isfinite.(cac_data)
-            if sum(valid_mask) < 10
-                println("⚠️  Warning: $nt has insufficient valid data")
+            # Check if we have enough data points
+            if nrow(df) < 100
+                println("⚠️  Warning: $nt has only $(nrow(df)) points, skipping comparison")
                 continue
             end
             
-            caer_data = caer_data[valid_mask]
-            cac_data = cac_data[valid_mask]
+            dsol_window = filter(:timestamp => t -> t ≥ (maximum(df.timestamp) - 1000), df)
+            caer_idx = df_find_column(dsol_window, "caer")
+            cac_idx = df_find_column(dsol_window, "cac")
             
-            noise_comparison[nt] = Dict(
-                :caer_mean => mean(caer_data),
-                :caer_std => std(caer_data),
-                :cac_mean => mean(cac_data),
-                :cac_std => std(cac_data),
-                :correlation => cor(caer_data, cac_data),
-                :caer_data => caer_data,
-                :cac_data => cac_data
-            )
-            
-            println("\n$nt:")
-            println("  Valid points: $(length(caer_data))")
-            println("  CaER: μ=$(round(mean(caer_data), digits=6)), σ=$(round(std(caer_data), digits=6))")
-            println("  CaC:  μ=$(round(mean(cac_data), digits=6)), σ=$(round(std(cac_data), digits=6))")
-            println("  CaER-CaC correlation: $(round(cor(caer_data, cac_data), digits=4))")
-        end
-    end
-end
+            if !isnothing(caer_idx) && !isnothing(cac_idx)
+                # Safe indexing - take last available points
+                n_points = min(1000, nrow(df))
+                start_idx = max(1, nrow(df) - n_points + 1)
 
-# Check if they're actually different
-println("\n" * "-"^80)
-println("PAIRWISE COMPARISONS:")
-println("-"^80)
-
-all_identical = true
-
-# Use a non-constant local name to avoid clashing with any existing `n`
-N = length(noise_list)
-corrmat = fill(NaN, N, N)
-maemat  = fill(NaN, N, N)
-
-for i in 1:N
-    corrmat[i,i] = 1.0
-    maemat[i,i]  = 0.0
-    for j in (i+1):N
-        nt1, nt2 = noise_list[i], noise_list[j]
-        if haskey(noise_comparison, nt1) && haskey(noise_comparison, nt2)
-            d1 = noise_comparison[nt1][:caer_data]
-            d2 = noise_comparison[nt2][:caer_data]
-
-            # align by taking the last min-length segment
-            minlen = min(length(d1), length(d2))
-            if minlen < 5
-                # leave NaN entries for insufficient overlap
-                continue
-            end
-            d1s = d1[end-minlen+1:end]
-            d2s = d2[end-minlen+1:end]
-
-            c = cor(d1s, d2s)
-            m = mean(abs.(d1s .- d2s))
-
-            corrmat[i,j] = c
-            corrmat[j,i] = c
-            maemat[i,j]  = m
-            maemat[j,i]  = m
-
-            # keep a simple summary flag consistent with previous logic
-            if c <= 0.95
-                all_identical = false
+                caer_data = df[start_idx:end, caer_idx]
+                cac_data = df[start_idx:end, cac_idx]
+                
+                # Filter out NaN/Inf values
+                valid_mask = isfinite.(caer_data) .& isfinite.(cac_data)
+                if sum(valid_mask) < 10
+                    println("⚠️  Warning: $nt has insufficient valid data")
+                    continue
+                end
+                
+                caer_data = caer_data[valid_mask]
+                cac_data = cac_data[valid_mask]
+                
+                noise_comparison[nt] = Dict(
+                    :caer_mean => mean(caer_data),
+                    :caer_std => std(caer_data),
+                    :cac_mean => mean(cac_data),
+                    :cac_std => std(cac_data),
+                    :correlation => cor(caer_data, cac_data),
+                    :caer_data => caer_data,
+                    :cac_data => cac_data
+                )
+                
+                println("\n$nt:")
+                println("  Valid points: $(length(caer_data))")
+                println("  CaER: μ=$(round(mean(caer_data), digits=6)), σ=$(round(std(caer_data), digits=6))")
+                println("  CaC:  μ=$(round(mean(cac_data), digits=6)), σ=$(round(std(cac_data), digits=6))")
+                println("  CaER-CaC correlation: $(round(cor(caer_data, cac_data), digits=4))")
             end
         end
     end
+    
+    return noise_comparison
 end
 
-# Nicely print matrices
-using Printf
+"""
+Check pairwise differences between noise types.
+Returns (all_identical, corrmat, maemat).
+"""
+function check_pairwise_differences(noise_list, noise_comparison)
+    println("\n" * "-"^80)
+    println("PAIRWISE COMPARISONS:")
+    println("-"^80)
 
-println("\nPairwise Correlation matrix (rows/cols = $(join(string.(noise_list), ", ")))")
-# header
-print(rpad("", 18))
-for t in noise_list
-    print(rpad(string(t), 12))
-end
-println()
-# rows
-for i in 1:N
-    print(rpad(string(noise_list[i]), 18))
-    for j in 1:N
-        v = corrmat[i,j]
-        if isnan(v)
-            print(rpad("-", 12))
-        else
-            print(rpad(@sprintf("%6.4f", v), 12))
+    all_identical = true
+    N = length(noise_list)
+    corrmat = fill(NaN, N, N)
+    maemat  = fill(NaN, N, N)
+
+    for i in 1:N
+        corrmat[i,i] = 1.0
+        maemat[i,i]  = 0.0
+        for j in (i+1):N
+            nt1, nt2 = noise_list[i], noise_list[j]
+            if haskey(noise_comparison, nt1) && haskey(noise_comparison, nt2)
+                d1 = noise_comparison[nt1][:caer_data]
+                d2 = noise_comparison[nt2][:caer_data]
+
+                minlen = min(length(d1), length(d2))
+                if minlen < 5
+                    continue
+                end
+                d1s = d1[end-minlen+1:end]
+                d2s = d2[end-minlen+1:end]
+
+                c = cor(d1s, d2s)
+                m = mean(abs.(d1s .- d2s))
+
+                corrmat[i,j] = c
+                corrmat[j,i] = c
+                maemat[i,j]  = m
+                maemat[j,i]  = m
+
+                if c <= 0.95
+                    all_identical = false
+                end
+            end
         end
     end
-    println()
+    
+    return all_identical, corrmat, maemat
 end
 
-println("\nPairwise Mean Absolute Error (MAE) matrix (same ordering):")
-print(rpad("", 18))
-for t in noise_list
-    print(rpad(string(t), 12))
-end
-println()
-for i in 1:N
-    print(rpad(string(noise_list[i]), 18))
-    for j in 1:N
-        v = maemat[i,j]
-        if isnan(v)
-            print(rpad("-", 12))
-        else
-            print(rpad(@sprintf("%8.4e", v), 12))
-        end
+"""
+Print formatted pairwise comparison matrices and summary.
+"""
+function print_pairwise_comparison(noise_list, corrmat, maemat, all_identical)
+    N = length(noise_list)
+    
+    println("\nPairwise Correlation matrix (rows/cols = $(join(string.(noise_list), ", ")))")
+    # header
+    print(rpad("", 18))
+    for t in noise_list
+        print(rpad(string(t), 12))
     end
     println()
+    # rows
+    for i in 1:N
+        print(rpad(string(noise_list[i]), 18))
+        for j in 1:N
+            v = corrmat[i,j]
+            if isnan(v)
+                print(rpad("-", 12))
+            else
+                print(rpad(@sprintf("%6.4f", v), 12))
+            end
+        end
+        println()
+    end
+
+    println("\nPairwise Mean Absolute Error (MAE) matrix (same ordering):")
+    print(rpad("", 18))
+    for t in noise_list
+        print(rpad(string(t), 12))
+    end
+    println()
+    for i in 1:N
+        print(rpad(string(noise_list[i]), 18))
+        for j in 1:N
+            v = maemat[i,j]
+            if isnan(v)
+                print(rpad("-", 12))
+            else
+                print(rpad(@sprintf("%8.4e", v), 12))
+            end
+        end
+        println()
+    end
+
+    # Summary output
+    if all_identical
+        println("\nStatus: ⚠️  All pairwise correlations are > 0.95 (possible identical/noise issue)")
+    else
+        println("\nStatus: ✅ At least one pair differs (correlation ≤ 0.95)")
+    end
 end
 
-# keep the boolean summary output consistent with the rest of the script
-if all_identical
-    println("\nStatus: ⚠️  All pairwise correlations are > 0.95 (possible identical/noise issue)")
-else
-    println("\nStatus: ✅ At least one pair differs (correlation ≤ 0.95)")
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+function run_experiments(; force::Bool = false, tspan=(0.0, 4000.0))
+    outdir = "imgs/bio/symbolic/"
+    # If outdir exists and contains any .png, skip unless force=true
+    if isdir(outdir) && !force
+        files = readdir(outdir)
+        if any(f -> endswith(lowercase(f), ".png"), files)
+            println("Found existing plots in $outdir — skipping experiments. Set force=true to rerun.")
+            return Dict()
+        end
+    end
+
+    mkpath(outdir)
+
+    println("\n" * "="^80)
+    println("SYMBOLIC STOCHASTIC METABOLIC MODEL")
+    println("="^80 * "\n")
+    println("\n" * "="^80)
+    println("Using Brownian Motion Noise Implementation")
+    println("="^80)
+
+    results = Dict{Symbol, Tuple}()
+    for noise_type in noise_list
+        t_start = time()
+        # run simulation
+        sol, vnames = simulate_model(noise_type; tspan=tspan)
+        t_solve = time() - t_start
+
+        # Check convergence (robust to different solver retcodes)
+        converged = (Symbol(sol.retcode) == :Success || Symbol(sol.retcode) == :Default) 
+
+        final_t = sol.t[end]
+        n_steps = length(sol.t)
+
+        status_icon = converged ? "✓" : "⚠️"
+        println("$status_icon Simulation $(sol.retcode): $(round(t_solve, digits=2))s, $n_steps steps, final t=$(round(final_t, digits=1))")
+
+        results[noise_type] = (sol, vnames)
+
+        # produce plots and save outputs
+        plot_results(sol, vnames, noise_type)
+
+        save_results(sol, vnames, noise_type)
+
+        println("\n✅ Successfully completed: $noise_type\n")
+    end
+
+    # Compare and diagnostics
+    compare_noise_types(results, var_names)
+
+    println("\n" * "="^80)
+    println("ALL SIMULATIONS COMPLETE!")
+    println("="^80)
+    println("\nResults saved in:")
+    println("  - $outdir")
+
+    verify_noise_differences(results)
+
+    # Build noise comparison dictionary and pairwise checks
+    noise_comparison = build_noise_comparison(results, noise_list)
+    all_identical, corrmat, maemat = check_pairwise_differences(noise_list, noise_comparison)
+    print_pairwise_comparison(noise_list, corrmat, maemat, all_identical)
+
+    return results
 end
+
+
+# Example usage:
+results = run_experiments()              # will skip if PNGs exist
+# results = run_experiments(force=true)    # force rerun even if PNGs exist
