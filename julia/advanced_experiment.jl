@@ -314,6 +314,9 @@ function extract_all_metrics(dfs::Vector{DataFrame}, ip3_val::Float64)
         return create_nan_row(ip3_val)
     end
 
+    # CRITICAL FIX: Use TIME-BASED window (last 4000 seconds), not point-based
+    analysis_window = 4000.0  # seconds
+
     # Storage for ensemble aggregation
     ratio_means = Float64[]
     ratio_stds = Float64[]
@@ -330,12 +333,10 @@ function extract_all_metrics(dfs::Vector{DataFrame}, ip3_val::Float64)
     var_means = Dict(var => Float64[] for var in important_variables)
     
     for df_sol in dfs
-        # Use last 4000 points for steady-state (from 8000s simulation)
-        n_points = min(4000, nrow(df_sol))
+        ratio = calculate_atp_adp_ratio(df_sol, analysis_window)
         
-        # ATP:ADP ratio
-        ratio = calculate_atp_adp_ratio(df_sol, n_points)
         if !isnothing(ratio) && length(ratio) > 10
+            # FIX: Store mean of the ratio vector, not ratio of means
             push!(ratio_means, mean(ratio))
             push!(ratio_stds, std(ratio))
             push!(ratio_mins, minimum(ratio))
@@ -352,7 +353,7 @@ function extract_all_metrics(dfs::Vector{DataFrame}, ip3_val::Float64)
             peaks = detect_peaks(ratio; threshold_percentile=75.0)
             push!(peak_counts, length(peaks))
             
-            # ISI analysis (use full data for better statistics)
+            # ISI analysis (use full windowed data for better statistics)
             events = detect_escape_events(ratio; low_percentile=25.0, high_percentile=75.0)
             if length(events) >= 3
                 isi = calculate_isi(events, 1.0)
@@ -364,10 +365,22 @@ function extract_all_metrics(dfs::Vector{DataFrame}, ip3_val::Float64)
             end
         end
         
-        # Important variables
+        # Important variables (using windowed data)
+        # Apply consistent TIME-BASED windowing
+        t_max = maximum(df_sol.timestamp)
+        t_start = max(0.0, t_max - analysis_window)
+        mask = df_sol.timestamp .>= t_start
+        
+        if sum(mask) < 10
+            continue
+        end
+        
+        df_windowed = df_sol[mask, :]
+        
         for var in important_variables
-            var_data = get_last_n_points(df_sol, var, n_points)
-            if !isnothing(var_data)
+            col_idx = df_find_column(df_windowed, var)
+            if !isnothing(col_idx)
+                var_data = df_windowed[!, col_idx]
                 valid_data = filter(isfinite, var_data)
                 if length(valid_data) > 0
                     push!(var_means[var], mean(valid_data))
@@ -427,14 +440,34 @@ end
 function plot_task2_atp_adp_ratio(results_all, n_ensemble)
     println("\n--- Task 2: IP3 vs ATP:ADP Ratio ---")
     
+    # Define IP3 range filters for each noise type
+    ip3_min_filter = Dict(
+        :none => 0.1,
+        :additive => 0.2,           # Start from 0.2
+        :multiplicative => 0.1,
+        :state_dependent => 0.3,    # Start from 0.3
+        :jump => 0.1
+    )
+
     # Separate plots per noise type
     for (nt, df) in results_all
-        valid = .!isnan.(df.atp_adp_ratio_mean)
+        # Apply IP3 filter for this noise type
+        ip3_min = get(ip3_min_filter, nt, 0.1)
+        ip3_filter = df.ip3 .>= ip3_min
+        valid = .!isnan.(df.atp_adp_ratio_mean) .& ip3_filter
+
         if sum(valid) > 0
+            std_vals = coalesce.(df.atp_adp_ratio_std[valid], 0.0)
+            y_min_data = minimum(df.atp_adp_ratio_mean[valid] .- std_vals)
+            y_max_data = maximum(df.atp_adp_ratio_mean[valid] .+ std_vals)
+            y_min = min(0.0, y_min_data * 1.1)  # Include 0 or go lower if data is negative
+            y_max = y_max_data * 1.1
+            
             p = plot(xlabel="IP3 (μM)", ylabel="Mean ATP:ADP Ratio",
                     title="$nt: IP3 vs Mean ATP:ADP Ratio (n=$n_ensemble runs)",
                     legend=false, size=(700, 500),
-                    left_margin=10Plots.mm, bottom_margin=8Plots.mm)
+                    left_margin=10Plots.mm, bottom_margin=8Plots.mm,
+                    ylims=(y_min, y_max))
             plot!(p, df.ip3[valid], df.atp_adp_ratio_mean[valid],
                 marker=:circle, linewidth=2, markersize=5,
                 ribbon=df.atp_adp_ratio_std[valid], fillalpha=0.3,
@@ -445,10 +478,24 @@ function plot_task2_atp_adp_ratio(results_all, n_ensemble)
     end
 
     # Combined plot
+    y_min = 0.0
+    y_max = 0.0
+    for (nt, df) in results_all
+        valid = .!isnan.(df.atp_adp_ratio_mean)
+        if sum(valid) > 0
+            std_vals = coalesce.(df.atp_adp_ratio_std[valid], 0.0)
+            y_min = min(y_min, minimum(df.atp_adp_ratio_mean[valid] .- std_vals))
+            y_max = max(y_max, maximum(df.atp_adp_ratio_mean[valid] .+ std_vals))
+        end
+    end
+    y_min = min(0.0, y_min * 1.1)
+    y_max *= 1.1
+
     p_combined = plot(xlabel="IP3 (μM)", ylabel="Mean ATP:ADP Ratio",
                     title="IP3 vs ATP:ADP Ratio (All Noise Types)",
                     legend=:topright, size=(900, 600),
-                    left_margin=10Plots.mm, bottom_margin=8Plots.mm)
+                    left_margin=10Plots.mm, bottom_margin=8Plots.mm,
+                    ylims=(y_min, y_max))
     for (nt, df) in results_all
         valid = .!isnan.(df.atp_adp_ratio_mean)
         if sum(valid) > 0
@@ -471,10 +518,12 @@ function plot_task3_frequency(results_all)
         df = results_all[nt]
         valid = .!isnan.(df.dominant_freq) .& (df.dominant_freq .> 0)
         if sum(valid) > 0
+            y_max = maximum(df.dominant_freq[valid]) * 1.2
             p = plot(xlabel="IP3 (μM)", ylabel="Dominant Frequency (Hz)",
                     title="$nt: Dominant Frequency vs IP3",
                     legend=false, size=(700, 500),
-                    left_margin=10Plots.mm, bottom_margin=8Plots.mm)
+                    left_margin=10Plots.mm, bottom_margin=8Plots.mm,
+                    ylims=(0, y_max))
             plot!(p, df.ip3[valid], df.dominant_freq[valid],
                   marker=:circle, linewidth=2, markersize=5,
                   color=get(color_map, nt, :blue))
@@ -489,9 +538,11 @@ function plot_task3_frequency(results_all)
         df = results_all[nt]
         valid = .!isnan.(df.dominant_freq) .& (df.dominant_freq .> 0)
         
+        y_max = sum(valid) > 0 ? maximum(df.dominant_freq[valid]) * 1.2 : 1.0
         p = plot(xlabel="IP3 (μM)", ylabel="Freq (Hz)",
                 title="$nt", legend=false, titlefontsize=10,
-                left_margin=8Plots.mm, bottom_margin=8Plots.mm)
+                left_margin=8Plots.mm, bottom_margin=8Plots.mm,
+                ylims=(0, y_max))
         
         if sum(valid) > 2
             x = df.ip3[valid]
@@ -542,10 +593,12 @@ function plot_task3_frequency(results_all)
         df = results_all[nt]
         valid = .!isnan.(df.freq_variance)
         if sum(valid) > 0
+            y_max = maximum(df.freq_variance[valid]) * 1.2
             p = plot(xlabel="IP3 (μM)", ylabel="Frequency Variance",
                     title="$nt: Frequency Variance vs IP3",
                     legend=false, size=(700, 500),
-                    left_margin=10Plots.mm, bottom_margin=8Plots.mm)
+                    left_margin=10Plots.mm, bottom_margin=8Plots.mm,
+                    ylims=(0, y_max))
             plot!(p, df.ip3[valid], df.freq_variance[valid],
                   marker=:circle, linewidth=2, markersize=5,
                   color=get(color_map, nt, :blue))
@@ -559,10 +612,12 @@ function plot_task3_frequency(results_all)
     for nt in stochastic_noises
         df = results_all[nt]
         valid = .!isnan.(df.freq_variance)
-        
+
+        y_max = sum(valid) > 0 ? maximum(df.freq_variance[valid]) * 1.2 : 1.0
         p = plot(xlabel="IP3 (μM)", ylabel="Freq Var",
                 title="$nt", legend=false, titlefontsize=10,
-                left_margin=8Plots.mm, bottom_margin=8Plots.mm)
+                left_margin=8Plots.mm, bottom_margin=8Plots.mm,
+                ylims=(0, y_max))
         
         if sum(valid) > 2
             x = df.ip3[valid]
@@ -710,6 +765,18 @@ function plot_task4_kramers(results_all, raw_data, ip3_range)
     # Row 2: IP3 as X-axis, log(ATP:ADP) as colorbar
     # =========================================================================
     
+    # First, calculate global y_max for escape rate across all noise types
+    rate_y_max = 0.0
+    for nt in stochastic_noises
+        df = results_all[nt]
+        valid = .!isnan.(df.escape_rate) .& .!isnan.(df.atp_adp_ratio_mean) .& 
+                (df.escape_rate .> 0) .& (df.atp_adp_ratio_mean .> 0)
+        if sum(valid) > 0
+            rate_y_max = max(rate_y_max, maximum(df.escape_rate[valid]))
+        end
+    end
+    rate_y_max *= 1.1
+
     # Row 1: log(ATP:ADP) as X-axis, IP3 as colorbar
     row1_plots = []
     for nt in stochastic_noises
@@ -719,7 +786,8 @@ function plot_task4_kramers(results_all, raw_data, ip3_range)
         
         p = plot(xlabel="log₁₀(ATP:ADP)", ylabel="Escape Rate (1/s)",
                 title="$nt", legend=false, titlefontsize=10,
-                left_margin=8Plots.mm, bottom_margin=8Plots.mm, top_margin=3Plots.mm)
+                left_margin=8Plots.mm, bottom_margin=8Plots.mm, top_margin=3Plots.mm, 
+                ylims=(0, rate_y_max))
         
         if sum(valid) > 2
             x_log_energy = log10.(df.atp_adp_ratio_mean[valid])
@@ -754,7 +822,8 @@ function plot_task4_kramers(results_all, raw_data, ip3_range)
         
         p = plot(xlabel="IP3 (μM)", ylabel="Escape Rate (1/s)",
                 title="$nt", legend=false, titlefontsize=10,
-                left_margin=8Plots.mm, bottom_margin=8Plots.mm, top_margin=3Plots.mm)
+                left_margin=8Plots.mm, bottom_margin=8Plots.mm, top_margin=3Plots.mm,
+                ylims=(0, rate_y_max))
         
         if sum(valid) > 2
             x_ip3 = df.ip3[valid]
@@ -807,6 +876,17 @@ function plot_task4_kramers(results_all, raw_data, ip3_range)
     # Row 1: log(ATP:ADP) as X-axis, IP3 as colorbar
     # Row 2: IP3 as X-axis, log(ATP:ADP) as colorbar
     # =========================================================================
+    # First, calculate global y_max for escape rate across all noise types
+    rate_y_max = 0.0
+    for nt in stochastic_noises
+        df = results_all[nt]
+        valid = .!isnan.(df.isi_entropy) .& .!isnan.(df.atp_adp_ratio_mean) .& 
+                (df.isi_entropy .> 0) .& (df.atp_adp_ratio_mean .> 0)
+        if sum(valid) > 0
+            rate_y_max = max(rate_y_max, maximum(df.isi_entropy[valid]))
+        end
+    end
+    rate_y_max *= 1.1
     
     # Row 1: log(ATP:ADP) as X-axis, IP3 as colorbar
     row1_entropy = []
@@ -817,7 +897,8 @@ function plot_task4_kramers(results_all, raw_data, ip3_range)
         
         p = plot(xlabel="log₁₀(ATP:ADP)", ylabel="ISI Entropy (bits)",
                 title="$nt", legend=false, titlefontsize=10,
-                left_margin=8Plots.mm, bottom_margin=8Plots.mm, top_margin=3Plots.mm)
+                left_margin=8Plots.mm, bottom_margin=8Plots.mm, top_margin=3Plots.mm,
+                ylims=(0, rate_y_max))
         
         if sum(valid) > 2
             x_log_energy = log10.(df.atp_adp_ratio_mean[valid])
@@ -851,7 +932,8 @@ function plot_task4_kramers(results_all, raw_data, ip3_range)
         
         p = plot(xlabel="IP3 (μM)", ylabel="ISI Entropy (bits)",
                 title="$nt", legend=false, titlefontsize=10,
-                left_margin=8Plots.mm, bottom_margin=8Plots.mm, top_margin=3Plots.mm)
+                left_margin=8Plots.mm, bottom_margin=8Plots.mm, top_margin=3Plots.mm,
+                ylims=(0, rate_y_max))
         
         if sum(valid) > 2
             x_ip3 = df.ip3[valid]
@@ -1057,7 +1139,7 @@ function plot_task4_kramers(results_all, raw_data, ip3_range)
             
             test_isi = Float64[]
             for df_sol in dfs
-                ratio = calculate_atp_adp_ratio(df_sol, 4000)
+                ratio = calculate_atp_adp_ratio(df_sol, 4000.0)
                 if isnothing(ratio) || length(ratio) < 100; continue; end
                 
                 events = detect_escape_events(ratio; low_percentile=25.0, high_percentile=75.0)
@@ -1097,7 +1179,7 @@ function plot_task4_kramers(results_all, raw_data, ip3_range)
             dfs = get(raw_data[noise_type], representative_ip3, DataFrame[])
             if !isempty(dfs)
                 df_sol = first(dfs)
-                ratio = calculate_atp_adp_ratio(df_sol, 4000)
+                ratio = calculate_atp_adp_ratio(df_sol, 4000.0)
                 
                 if !isnothing(ratio) && length(ratio) > 100
                     # Use FFT to find dominant period
@@ -1221,7 +1303,7 @@ function plot_task4_kramers(results_all, raw_data, ip3_range)
         for ip3 in [0.7, 0.8, 0.9, 1.0]
             dfs = get(raw_data[noise_type], ip3, DataFrame[])
             for df_sol in dfs
-                ratio = calculate_atp_adp_ratio(df_sol, 4000)
+                ratio = calculate_atp_adp_ratio(df_sol, 4000.0)
                 if isnothing(ratio); continue; end
                 
                 events = detect_escape_events(ratio; low_percentile=25.0, high_percentile=75.0)
@@ -1305,19 +1387,12 @@ function plot_bifurcation_analysis(raw_data, results_all, ip3_range)
         df_sol = first(dfs) 
         t_max = maximum(df_sol.timestamp)
         
-        # Apply Window (Steady State Filter)
-        t_start = max(0.0, t_max - analysis_window)
-        mask = df_sol.timestamp .>= t_start
+        ratio = calculate_atp_adp_ratio(df_sol, analysis_window)
         
-        if sum(mask) < 10; continue; end
-        
-        df_win = df_sol[mask, :]
-        
-        # 1. Calculate Ratio & Amplitude
-        atpc = df_win[!, df_find_column(df_win, "atpc")]
-        adpc = df_win[!, df_find_column(df_win, "adpc")]
-        ratio = atpc ./ adpc
-        
+        if isnothing(ratio) || length(ratio) < 10
+            continue
+        end
+
         r_mean = mean(ratio)
         r_min = minimum(ratio)
         r_max = maximum(ratio)
@@ -1339,7 +1414,9 @@ function plot_bifurcation_analysis(raw_data, results_all, ip3_range)
         end
         
         # Estimate Frequency (Hz) = (Peaks - 1) / Duration
-        duration = df_win.timestamp[end] - df_win.timestamp[1]
+        # Get the time window duration
+        t_start = max(0.0, t_max - analysis_window)
+        duration = t_max - t_start
         freq = (n_peaks > 1 && duration > 0) ? (n_peaks - 1) / duration : 0.0
         
         push!(bif_data, (ip3, r_mean, r_min, r_max, is_osc, r_amp, freq, n_peaks))
@@ -1352,10 +1429,13 @@ function plot_bifurcation_analysis(raw_data, results_all, ip3_range)
     
     if nrow(bif_data) > 0
         # ----- 1a. ATP:ADP Ratio Bifurcation Diagram -----
+        y_max = maximum(bif_data.ratio_max) * 1.1
+
         p_bif = plot(xlabel="IP3 (μM)", ylabel="ATP:ADP Ratio",
                     title="Bifurcation Diagram (Steady State)",
                     legend=:topright, size=(1000, 600),
-                    left_margin=10Plots.mm, bottom_margin=8Plots.mm)
+                    left_margin=10Plots.mm, bottom_margin=8Plots.mm,
+                    ylims=(0, y_max))
         
         # Mean
         plot!(p_bif, bif_data.ip3, bif_data.ratio_mean,
@@ -1390,6 +1470,7 @@ function plot_bifurcation_analysis(raw_data, results_all, ip3_range)
         println("Saved: imgs/bio/bifurcation/bifurcation_ratio.png")
         
         # ----- 1b. Amplitude vs IP3 -----
+        y_max_amp = maximum(bif_data.amp) * 1.2
         p_amp = plot(bif_data.ip3, bif_data.amp,
                     xlabel="IP3 (μM)", ylabel="Amplitude (Max-Min)", title="Oscillation Amplitude",
                     legend=false, size=(900, 500),
@@ -1403,16 +1484,18 @@ function plot_bifurcation_analysis(raw_data, results_all, ip3_range)
         # Filter out zero frequency (stable points) to show trend clearly
         valid_freq = bif_data.freq .> 0
         if sum(valid_freq) > 0
+            y_max_freq = maximum(bif_data.freq[valid_freq]) * 1.2            
             p_freq = plot(bif_data.ip3[valid_freq], bif_data.freq[valid_freq],
                         xlabel="IP3 (μM)", ylabel="Frequency (Hz)", title="Oscillation Frequency",
                         legend=false, size=(900, 500),
                         marker=:circle, linewidth=2, color=:orange,
-                        left_margin=10Plots.mm, bottom_margin=8Plots.mm)
+                        left_margin=10Plots.mm, bottom_margin=8Plots.mm, ylims=(0, y_max_freq))
             savefig(p_freq, "imgs/bio/bifurcation/bifurcation_frequency.png")
             println("Saved: imgs/bio/bifurcation/bifurcation_frequency.png")
         end
 
         # ----- 1d. Peak Count vs IP3 (RESTORED) -----
+        y_max_peaks = maximum(bif_data.peaks) * 1.2
         p_peaks = plot(bif_data.ip3, bif_data.peaks,
                       xlabel="IP3 (μM)", ylabel="Peak Count (in 2000s)", title="Peak Count",
                       legend=false, size=(900, 500),
@@ -1422,7 +1505,8 @@ function plot_bifurcation_analysis(raw_data, results_all, ip3_range)
         println("Saved: imgs/bio/bifurcation/bifurcation_peaks.png")
         
         # ----- 1e. Summary Panel -----
-        p1 = plot(bif_data.ip3, bif_data.ratio_mean, title="Ratio Range", ylabel="Ratio", legend=false)
+        y_max_ratio = maximum(bif_data.ratio_max) * 1.1
+        p1 = plot(bif_data.ip3, bif_data.ratio_mean, title="Ratio Range", ylabel="Ratio", legend=false, ylims=(0, y_max_ratio))
         plot!(p1, bif_data.ip3, bif_data.ratio_mean, ribbon=(bif_data.ratio_mean .- bif_data.ratio_min, bif_data.ratio_max .- bif_data.ratio_mean), fillalpha=0.3)
         
         p2 = plot(bif_data.ip3, bif_data.amp, title="Amplitude", ylabel="Amp", legend=false)
@@ -1544,15 +1628,28 @@ function plot_important_variables(results_all)
     legend_positions = Dict(
         "adpc" => :bottomright, "cac" => :bottomright,
         "atpc" => :topright, "caer" => :topright,
-        "psi" => :topright, "pyrm" => :topright
+        "psi" => :bottomright, "pyrm" => :topright
     )
     
     for var in important_variables
         leg_pos = get(legend_positions, var, :topright)
+        # Calculate y_max across all noise types
+        y_max = 0.0
+        for (nt, df) in results_all
+            if var in names(df)
+                valid_idx = .!isnan.(df[!, var])
+                if sum(valid_idx) > 0
+                    y_max = max(y_max, maximum(df[!, var][valid_idx]))
+                end
+            end
+        end
+        y_max *= 1.1
+        
         p = plot(xlabel="IP3 (μM)", ylabel="$var (steady state)", 
                  title="Steady State $var vs IP3", 
                  legend=leg_pos, size=(900, 600),
-                 left_margin=10Plots.mm, bottom_margin=8Plots.mm)
+                 left_margin=10Plots.mm, bottom_margin=8Plots.mm, 
+                 ylims=(var != "psi" ? (0, y_max) : (:auto)))
         
         for (nt, df) in results_all
             if var in names(df)
@@ -1572,9 +1669,20 @@ function plot_important_variables(results_all)
     # Combined overview
     plots_combined = []
     for (i, var) in enumerate(important_variables)
+        # Calculate y_max for this variable
+        y_max = 0.0
+        for (nt, df) in results_all
+            if var in names(df)
+                valid_idx = .!isnan.(df[!, var])
+                if sum(valid_idx) > 0
+                    y_max = max(y_max, maximum(df[!, var][valid_idx]))
+                end
+            end
+        end
+        y_max *= 1.1
         p = plot(xlabel="IP3 (μM)", ylabel=var, title=var, 
                 legend=(i == 1) ? :topright : false,
-                left_margin=8Plots.mm, bottom_margin=6Plots.mm)
+                left_margin=8Plots.mm, bottom_margin=6Plots.mm, ylims=(0, y_max))
         
         for (nt, df) in results_all
             if var in names(df)
@@ -1598,15 +1706,38 @@ end
 
 function plot_summary(results_all)
     println("\n--- Summary Plots ---")
-    
+    # Calculate y_max for each subplot
+    freq_max, fvar_max, rate_max, entropy_max = 0.0, 0.0, 0.0, 0.0
+    for (nt, df) in results_all
+        valid = .!isnan.(df.dominant_freq) .& (df.dominant_freq .> 0)
+        if sum(valid) > 0
+            freq_max = max(freq_max, maximum(df.dominant_freq[valid]))
+        end
+        
+        valid = .!isnan.(df.freq_variance)
+        if sum(valid) > 0
+            fvar_max = max(fvar_max, maximum(df.freq_variance[valid]))
+        end
+        
+        valid = .!isnan.(df.escape_rate) .& (df.escape_rate .> 0)
+        if sum(valid) > 0
+            rate_max = max(rate_max, maximum(df.escape_rate[valid]))
+        end
+        
+        valid = .!isnan.(df.isi_entropy)
+        if sum(valid) > 0
+            entropy_max = max(entropy_max, maximum(df.isi_entropy[valid]))
+        end
+    end
+
     p1 = plot(xlabel="IP3 (μM)", ylabel="Freq (Hz)", title="Oscillation Frequency", 
-              legend=:topleft, size=(400, 350))
+              legend=:topleft, size=(400, 350), ylims=(0, freq_max * 1.1))
     p2 = plot(xlabel="IP3 (μM)", ylabel="Freq Var", title="Frequency Variability", 
-              legend=false, size=(400, 350))
+              legend=false, size=(400, 350), ylims=(0, fvar_max * 1.1))
     p3 = plot(xlabel="IP3 (μM)", ylabel="Rate (1/s)", title="Escape Rate", 
-              legend=false, size=(400, 350))
+              legend=false, size=(400, 350), ylims=(0, rate_max * 1.1))
     p4 = plot(xlabel="IP3 (μM)", ylabel="Entropy (bits)", title="ISI Entropy", 
-              legend=false, size=(400, 350))
+              legend=false, size=(400, 350), ylims=(0, entropy_max * 1.1))
 
     for (nt, df) in results_all
         c = get(color_map, nt, :auto)
@@ -1684,7 +1815,7 @@ function scan_noise_strength_experiment()
                 end
                 
                 df_sol = DataFrame(sol)
-                ratio = calculate_atp_adp_ratio(df_sol, 1000)
+                ratio = calculate_atp_adp_ratio(df_sol, 1000.0)
                 
                 if !isnothing(ratio) && length(ratio) > 10
                     push!(df_res, (σ, mean(ratio), std(ratio)))
@@ -1710,11 +1841,13 @@ function scan_noise_strength_experiment()
     # =========================================================================
     for (nt, df) in results
         valid_idx = .!isnan.(df.mean_ratio)
+        y_max = maximum(df.mean_ratio[valid_idx] .+ coalesce.(df.std_ratio[valid_idx], 0.0)) * 1.1            
         if sum(valid_idx) > 0
             p = plot(xlabel="Noise Strength (σ)", ylabel="Mean ATP:ADP Ratio",
                      title="$nt: Noise Strength vs ATP:ADP Ratio",
                      legend=false, size=(700, 500),
-                     left_margin=10Plots.mm, bottom_margin=8Plots.mm)
+                     left_margin=10Plots.mm, bottom_margin=8Plots.mm,
+                     ylims=(0, y_max))
             
             plot!(p, df.noise_strength[valid_idx], df.mean_ratio[valid_idx],
                   marker=:circle, linewidth=2, markersize=6,
@@ -1729,10 +1862,19 @@ function scan_noise_strength_experiment()
     # =========================================================================
     # COMBINED PLOT
     # =========================================================================
+    y_max = 0.0
+    for (nt, df) in results
+        valid_idx = .!isnan.(df.mean_ratio)
+        if sum(valid_idx) > 0
+            y_max = max(y_max, maximum(df.mean_ratio[valid_idx] .+ coalesce.(df.std_ratio[valid_idx], 0.0)))
+        end
+    end
+    y_max *= 1.1
     p_combined = plot(xlabel="Noise Strength (σ)", ylabel="Mean ATP:ADP Ratio",
                       title="Noise Strength vs ATP:ADP Ratio",
                       legend=:topright, size=(900, 600),
-                      left_margin=10Plots.mm, bottom_margin=8Plots.mm)
+                      left_margin=10Plots.mm, bottom_margin=8Plots.mm,
+                      ylims=(0, y_max))
     
     for (nt, df) in results
         valid_idx = .!isnan.(df.mean_ratio)
@@ -1751,21 +1893,23 @@ end
 
 
 function print_data_statistics(raw_data::Dict{Symbol, Dict{Float64, Vector{DataFrame}}})
-    println("\n" * "="^110)
-    println("DATA STATISTICS REPORT (Timestamps Check)")
-    println("="^110)
+    println("\n" * "="^130)
+    println("DATA STATISTICS REPORT (Timestamps & Biological Validity Check)")
+    println("="^130)
+    
+    analysis_window = 4000.0  # Same window as metric extraction
     
     # Table Header
-    # T_end-2 = 3rd to last timestamp
-    # T_end-1 = 2nd to last timestamp
-    # T_end   = Final timestamp
-    header_fmt = "%-8s | %-12s | %-5s | %-10s | %-10s | %-10s | %-10s"
-    row_fmt    = "%-8.1f | %-12s | %-5d | %-10.1f | %-10.1f | %-10.1f | %-10s"
+    header_fmt = "%-8s | %-12s | %-5s | %-10s | %-10s | %-10s | %-8s | %-8s | %-12s"
+    row_fmt    = "%-8.1f | %-12s | %-5d | %-10.1f | %-10.1f | %-10.1f | %-8d | %-8d | %-12s"
     
     println(Printf.format(Printf.Format(header_fmt), 
-        "IP3", "Noise Type", "Count", "T(end-2)", "T(end-1)", "T(end)", "Status"))
-    println("-"^110)
+        "IP3", "Noise Type", "Count", "T(end-2)", "T(end-1)", "T(end)", "NegRatio", "NegConc", "Status"))
+    println("-"^130)
 
+    # Track problematic combinations for summary
+    problematic_cases = []
+    
     # 1. Get sorted keys for consistent display
     all_ip3s = Set{Float64}()
     for (nt, subdict) in raw_data
@@ -1783,7 +1927,7 @@ function print_data_statistics(raw_data::Dict{Symbol, Dict{Float64, Vector{DataF
                 count = length(dfs)
                 
                 if count > 0
-                    # INSEPCT THE FIRST RUN AS A REPRESENTATIVE SAMPLE
+                    # INSPECT THE FIRST RUN AS A REPRESENTATIVE SAMPLE for timestamps
                     df_sample = first(dfs)
                     times = df_sample.timestamp
                     n_points = length(times)
@@ -1793,34 +1937,481 @@ function print_data_statistics(raw_data::Dict{Symbol, Dict{Float64, Vector{DataF
                     t_last2 = n_points > 1 ? times[end-1] : NaN
                     t_last3 = n_points > 2 ? times[end-2] : NaN
                     
-                    # Check for "Massive Jump" (Status Diagnosis)
+                    # =========================================================
+                    # NEW: Check ALL runs for negative values in analysis window
+                    # =========================================================
+                    n_negative_ratio_runs = 0
+                    n_negative_conc_runs = 0
+                    
+                    for (run_idx, df) in enumerate(dfs)
+                        # Apply same window as metric extraction
+                        t_max = maximum(df.timestamp)
+                        t_start = max(0.0, t_max - analysis_window)
+                        mask = df.timestamp .>= t_start
+                        
+                        if sum(mask) < 10
+                            continue
+                        end
+                        
+                        # Get ATPC and ADPC columns
+                        atpc_idx = df_find_column(df, "atpc")
+                        adpc_idx = df_find_column(df, "adpc")
+                        
+                        if !isnothing(atpc_idx) && !isnothing(adpc_idx)
+                            atpc_windowed = df[mask, atpc_idx]
+                            adpc_windowed = df[mask, adpc_idx]
+                            
+                            # Check for negative concentrations (biological violation)
+                            has_neg_atpc = any(x -> x < 0, atpc_windowed)
+                            has_neg_adpc = any(x -> x < 0, adpc_windowed)
+                            
+                            if has_neg_atpc || has_neg_adpc
+                                n_negative_conc_runs += 1
+                            end
+                            
+                            # Calculate ratio and check for negative/invalid values
+                            # Negative ratio can occur if one concentration goes negative
+                            valid_mask = (adpc_windowed .> 0) .& isfinite.(atpc_windowed) .& isfinite.(adpc_windowed)
+                            
+                            if sum(valid_mask) > 0
+                                ratio = atpc_windowed[valid_mask] ./ adpc_windowed[valid_mask]
+                                
+                                # Check for negative ratios (happens when atpc < 0)
+                                if any(x -> x < 0, ratio)
+                                    n_negative_ratio_runs += 1
+                                end
+                            else
+                                # All points invalid - count as problematic
+                                n_negative_ratio_runs += 1
+                            end
+                        end
+                    end
+                    
+                    # Determine status
                     status = "OK"
                     if n_points < 3
                         status = "FEW PTS"
                     elseif (t_end - t_last2) > 500.0
-                        # If the last step jumped more than 500 seconds
-                        status = "HUGE JUMP" 
+                        status = "HUGE JUMP"
                     elseif t_end < 100.0
                         status = "EARLY END"
+                    elseif n_negative_conc_runs > 0
+                        status = "NEG CONC!"
+                    elseif n_negative_ratio_runs > 0
+                        status = "NEG RATIO!"
+                    end
+                    
+                    # Track problematic cases
+                    if n_negative_conc_runs > 0 || n_negative_ratio_runs > 0
+                        push!(problematic_cases, (ip3, nt, count, n_negative_ratio_runs, n_negative_conc_runs))
                     end
                     
                     println(Printf.format(Printf.Format(row_fmt), 
-                        ip3, string(nt), count, t_last3, t_last2, t_end, status))
+                        ip3, string(nt), count, t_last3, t_last2, t_end, 
+                        n_negative_ratio_runs, n_negative_conc_runs, status))
                 else
                     println(Printf.format(Printf.Format(row_fmt), 
-                        ip3, string(nt), 0, NaN, NaN, NaN, "EMPTY"))
+                        ip3, string(nt), 0, NaN, NaN, NaN, 0, 0, "EMPTY"))
                 end
             else
                 println(Printf.format(Printf.Format(row_fmt), 
-                    ip3, string(nt), 0, NaN, NaN, NaN, "MISSING"))
+                    ip3, string(nt), 0, NaN, NaN, NaN, 0, 0, "MISSING"))
             end
         end
         # Separator between IP3 groups
         if !isempty(sorted_noise)
-            println("-"^110)
+            println("-"^130)
         end
     end
-    println("="^110 * "\n")
+    
+    # =========================================================================
+    # SUMMARY: Problematic cases
+    # =========================================================================
+    if !isempty(problematic_cases)
+        println("\n" * "="^80)
+        println("⚠️  BIOLOGICAL VALIDITY WARNINGS (Last $(Int(analysis_window))s window)")
+        println("="^80)
+        println("\nThe following combinations have runs with negative concentrations or ratios:")
+        println("This indicates numerical instability violating biological constraints.\n")
+        
+        println(rpad("IP3", 8), rpad("Noise Type", 15), rpad("Total Runs", 12), 
+                rpad("Neg Ratio", 12), rpad("Neg Conc", 12), "Severity")
+        println("-"^70)
+        
+        for (ip3, nt, total, neg_ratio, neg_conc) in problematic_cases
+            severity = if neg_conc > total/2
+                "CRITICAL"
+            elseif neg_conc > 0
+                "HIGH"
+            elseif neg_ratio > total/2
+                "MODERATE"
+            else
+                "LOW"
+            end
+            
+            println(rpad("$ip3", 8), rpad(string(nt), 15), rpad("$total", 12),
+                    rpad("$neg_ratio", 12), rpad("$neg_conc", 12), severity)
+        end
+        
+        println("\n" * "-"^70)
+        println("Legend:")
+        println("  NegRatio = Runs where ATP:ADP ratio contains negative values")
+        println("  NegConc  = Runs where ATP or ADP concentration went negative")
+        println("  CRITICAL = >50% runs have negative concentrations")
+        println("  HIGH     = Some runs have negative concentrations")
+        println("  MODERATE = >50% runs have negative ratios (but concentrations OK)")
+        println("  LOW      = Few runs affected")
+        println("\nRecommendation: Exclude CRITICAL/HIGH cases from analysis or")
+        println("                increase simulation stability (reduce noise, smaller dt)")
+    else
+        println("\n✓ All runs passed biological validity check (no negative concentrations)")
+    end
+    
+    println("="^130 * "\n")
+    
+    return problematic_cases
+end
+
+"""
+Validate results_all and raw_data for biological validity.
+Checks:
+1. Sufficient data points in analysis window
+2. No negative ATP:ADP ratios (biological impossibility)
+3. No negative concentrations (ATPC, ADPC, CaC, CaER)
+4. Reasonable value ranges (not exploded)
+
+Returns a detailed report and flags problematic combinations.
+"""
+function validate_biological_consistency(results_all::Dict{Symbol, DataFrame}, 
+                                         raw_data::Dict{Symbol, Dict{Float64, Vector{DataFrame}}};
+                                         analysis_window::Float64 = 4000.0,
+                                         verbose::Bool = true)
+    println("\n" * "="^100)
+    println("BIOLOGICAL VALIDITY CHECK")
+    println("="^100)
+    
+    validation_report = Dict{Symbol, DataFrame}()
+    problematic_combinations = []
+    
+    for noise_type in noise_list
+        if !haskey(raw_data, noise_type)
+            continue
+        end
+        
+        if verbose
+            println("\n--- Checking $noise_type ---")
+        end
+        
+        df_report = DataFrame(
+            ip3 = Float64[],
+            n_runs = Int[],
+            n_valid_runs = Int[],
+            n_negative_ratio = Int[],
+            n_negative_atpc = Int[],
+            n_negative_adpc = Int[],
+            n_insufficient_points = Int[],
+            n_exploded = Int[],
+            mean_ratio = Float64[],
+            std_ratio = Float64[],
+            min_ratio = Float64[],
+            max_ratio = Float64[],
+            status = String[]
+        )
+        
+        sorted_ip3 = sort(collect(keys(raw_data[noise_type])))
+        
+        for ip3 in sorted_ip3
+            dfs = raw_data[noise_type][ip3]
+            n_runs = length(dfs)
+            
+            if n_runs == 0
+                push!(df_report, (ip3, 0, 0, 0, 0, 0, 0, 0, NaN, NaN, NaN, NaN, "NO DATA"))
+                continue
+            end
+            
+            # Counters
+            n_valid = 0
+            n_neg_ratio = 0
+            n_neg_atpc = 0
+            n_neg_adpc = 0
+            n_insufficient = 0
+            n_exploded = 0
+            
+            all_ratios = Float64[]
+            
+            for (run_idx, df) in enumerate(dfs)
+                # Apply analysis window
+                t_max = maximum(df.timestamp)
+                t_start = max(0.0, t_max - analysis_window)
+                mask = df.timestamp .>= t_start
+                n_points = sum(mask)
+                
+                # Check 1: Sufficient points
+                if n_points < 100
+                    n_insufficient += 1
+                    continue
+                end
+                
+                # Get columns
+                atpc_idx = df_find_column(df, "atpc")
+                adpc_idx = df_find_column(df, "adpc")
+                
+                if isnothing(atpc_idx) || isnothing(adpc_idx)
+                    n_insufficient += 1
+                    continue
+                end
+                
+                atpc = df[mask, atpc_idx]
+                adpc = df[mask, adpc_idx]
+                
+                # Check 2: Negative concentrations
+                has_neg_atpc = any(x -> x < -1e-10, atpc)
+                has_neg_adpc = any(x -> x < -1e-10, adpc)
+                
+                if has_neg_atpc
+                    n_neg_atpc += 1
+                end
+                if has_neg_adpc
+                    n_neg_adpc += 1
+                end
+                
+                # Check 3: Exploded values (unreasonably large)
+                max_reasonable = 100.0  # Concentrations shouldn't exceed ~100 in this model
+                has_exploded = maximum(abs.(atpc)) > max_reasonable || maximum(abs.(adpc)) > max_reasonable
+                if has_exploded
+                    n_exploded += 1
+                end
+                
+                # Calculate ratio (only for positive values)
+                valid_mask = (atpc .> 0) .& (adpc .> 0) .& isfinite.(atpc) .& isfinite.(adpc)
+                
+                if sum(valid_mask) < 10
+                    n_insufficient += 1
+                    continue
+                end
+                
+                ratio = atpc[valid_mask] ./ adpc[valid_mask]
+                
+                # Check 4: Negative ratios (shouldn't happen if both positive, but check anyway)
+                if any(x -> x < 0, ratio)
+                    n_neg_ratio += 1
+                end
+                
+                # Only count as valid if no issues
+                if !has_neg_atpc && !has_neg_adpc && !has_exploded && sum(valid_mask) >= n_points * 0.9
+                    n_valid += 1
+                    append!(all_ratios, [mean(ratio)])  # Store mean ratio for this run
+                end
+            end
+            
+            # Calculate aggregate statistics from valid runs only
+            if length(all_ratios) > 0
+                mean_r = mean(all_ratios)
+                std_r = length(all_ratios) > 1 ? std(all_ratios) : 0.0
+                min_r = minimum(all_ratios)
+                max_r = maximum(all_ratios)
+            else
+                mean_r, std_r, min_r, max_r = NaN, NaN, NaN, NaN
+            end
+            
+            # Determine status
+            status = if n_valid == n_runs
+                "✓ OK"
+            elseif n_valid >= n_runs * 0.7
+                "⚠ PARTIAL"
+            elseif n_valid > 0
+                "⚠ UNSTABLE"
+            else
+                "✗ INVALID"
+            end
+            
+            # Track problematic cases
+            if n_neg_atpc > 0 || n_neg_adpc > 0 || n_neg_ratio > 0 || n_valid < n_runs * 0.5
+                push!(problematic_combinations, (noise_type, ip3, n_valid, n_runs, status))
+            end
+            
+            push!(df_report, (ip3, n_runs, n_valid, n_neg_ratio, n_neg_atpc, n_neg_adpc, 
+                             n_insufficient, n_exploded, mean_r, std_r, min_r, max_r, status))
+        end
+        
+        validation_report[noise_type] = df_report
+        
+        # Print summary for this noise type
+        if verbose
+            n_total_ip3 = nrow(df_report)
+            n_ok = sum(df_report.status .== "✓ OK")
+            n_partial = sum(startswith.(df_report.status, "⚠"))
+            n_invalid = sum(df_report.status .== "✗ INVALID")
+            
+            println("  Total IP3 values: $n_total_ip3")
+            println("  ✓ OK: $n_ok, ⚠ Partial/Unstable: $n_partial, ✗ Invalid: $n_invalid")
+            
+            # Show problematic IP3 values
+            prob_rows = df_report[df_report.status .!= "✓ OK", :]
+            if nrow(prob_rows) > 0
+                println("\n  Problematic IP3 values:")
+                for row in eachrow(prob_rows)
+                    println("    IP3=$(row.ip3): $(row.n_valid_runs)/$(row.n_runs) valid, " *
+                           "neg_atpc=$(row.n_negative_atpc), neg_adpc=$(row.n_negative_adpc), " *
+                           "exploded=$(row.n_exploded) → $(row.status)")
+                end
+            end
+        end
+    end
+    
+    # =========================================================================
+    # SUMMARY TABLE
+    # =========================================================================
+    println("\n" * "="^100)
+    println("SUMMARY: RECOMMENDED IP3 RANGES FOR EACH NOISE TYPE")
+    println("="^100)
+    
+    recommended_ranges = Dict{Symbol, Tuple{Float64, Float64}}()
+    
+    for noise_type in noise_list
+        if !haskey(validation_report, noise_type)
+            continue
+        end
+        
+        df = validation_report[noise_type]
+        valid_ip3 = df[df.status .== "✓ OK", :ip3]
+        
+        if length(valid_ip3) > 0
+            ip3_min = minimum(valid_ip3)
+            ip3_max = maximum(valid_ip3)
+            recommended_ranges[noise_type] = (ip3_min, ip3_max)
+            println("  $noise_type: IP3 ∈ [$ip3_min, $ip3_max] ($(length(valid_ip3)) valid points)")
+        else
+            # Fall back to partial validity
+            partial_ip3 = df[startswith.(df.status, "⚠"), :ip3]
+            if length(partial_ip3) > 0
+                ip3_min = minimum(partial_ip3)
+                ip3_max = maximum(partial_ip3)
+                recommended_ranges[noise_type] = (ip3_min, ip3_max)
+                println("  $noise_type: IP3 ∈ [$ip3_min, $ip3_max] ($(length(partial_ip3)) partial, use with caution)")
+            else
+                println("  $noise_type: ⚠️ NO VALID IP3 RANGE - all simulations unstable!")
+            end
+        end
+    end
+    
+    # =========================================================================
+    # COMPARISON WITH results_all
+    # =========================================================================
+    println("\n" * "="^100)
+    println("CHECKING results_all FOR INVALID VALUES")
+    println("="^100)
+    
+    for noise_type in noise_list
+        if !haskey(results_all, noise_type)
+            continue
+        end
+        
+        df = results_all[noise_type]
+        
+        # Check for negative mean ratios
+        neg_ratio_rows = df[.!isnan.(df.atp_adp_ratio_mean) .& (df.atp_adp_ratio_mean .< 0), :]
+        
+        # Check for huge standard deviations (sign of instability)
+        huge_std_rows = df[.!isnan.(df.atp_adp_ratio_std) .& (df.atp_adp_ratio_std .> 5.0), :]
+        
+        # Check for unreasonable mean ratios
+        unreasonable_rows = df[.!isnan.(df.atp_adp_ratio_mean) .& (df.atp_adp_ratio_mean .> 20.0), :]
+        
+        if nrow(neg_ratio_rows) > 0 || nrow(huge_std_rows) > 0 || nrow(unreasonable_rows) > 0
+            println("\n⚠️  $noise_type has invalid values in results_all:")
+            
+            if nrow(neg_ratio_rows) > 0
+                println("  NEGATIVE RATIOS at IP3: $(neg_ratio_rows.ip3)")
+            end
+            
+            if nrow(huge_std_rows) > 0
+                println("  HUGE STD (>5) at IP3: $(huge_std_rows.ip3)")
+                for row in eachrow(huge_std_rows)
+                    println("    IP3=$(row.ip3): mean=$(round(row.atp_adp_ratio_mean, digits=2)) ± $(round(row.atp_adp_ratio_std, digits=2))")
+                end
+            end
+            
+            if nrow(unreasonable_rows) > 0
+                println("  UNREASONABLE MEAN (>20) at IP3: $(unreasonable_rows.ip3)")
+            end
+        else
+            println("  $noise_type: ✓ All values in results_all appear reasonable")
+        end
+    end
+    
+    println("\n" * "="^100)
+    
+    return validation_report, problematic_combinations, recommended_ranges
+end
+
+"""
+Recalculate all metrics from existing raw_data without re-running simulations.
+Use this when you've fixed a bug in the metric calculation.
+"""
+function recalculate_results_from_raw_data(raw_data::Dict{Symbol, Dict{Float64, Vector{DataFrame}}}, 
+                                           ip3_range)
+    println("\n" * "="^80)
+    println("RECALCULATING RESULTS FROM RAW DATA")
+    println("="^80)
+    
+    results_all = Dict{Symbol, DataFrame}()
+    
+    for noise_type in noise_list
+        if !haskey(raw_data, noise_type)
+            println("⚠️ No data for $noise_type")
+            continue
+        end
+        
+        println("\nRecalculating metrics for $noise_type...")
+        
+        df_res = DataFrame(
+            ip3 = Float64[],
+            atp_adp_ratio_mean = Float64[],
+            atp_adp_ratio_std = Float64[],
+            atp_adp_ratio_sem = Float64[],
+            atp_adp_ratio_min = Float64[],
+            atp_adp_ratio_max = Float64[],
+            dominant_freq = Float64[],
+            freq_variance = Float64[],
+            isi_entropy = Float64[],
+            isi_entropy_std = Float64[],
+            isi_mean = Float64[],
+            isi_std = Float64[],
+            isi_cv = Float64[],
+            escape_rate = Float64[],
+            escape_rate_std = Float64[],
+            n_peaks = Int[],
+            n_events = Int[],
+            oscillation_amplitude = Float64[],
+            is_oscillating = Bool[]
+        )
+        
+        # Add columns for important variables
+        for var in important_variables
+            df_res[!, var] = Float64[]
+            df_res[!, "$(var)_std"] = Float64[]
+        end
+        
+        for val in ip3_range
+            dfs = get(raw_data[noise_type], val, DataFrame[])
+            
+            if isempty(dfs)
+                row = create_nan_row(val)
+                push!(df_res, row)
+                continue
+            end
+            
+            # Recalculate metrics
+            row = extract_all_metrics(dfs, val)
+            push!(df_res, row)
+        end
+        
+        results_all[noise_type] = df_res
+    end
+    
+    println("\n✓ Recalculation complete!")
+    return results_all
 end
 
 # ============================================================================
@@ -1849,6 +2440,19 @@ ip3_range = 0.1:0.1:2.0
 if isfile("results/advanced_analysis.jld2")
     println("\nLoading previous comprehensive analysis results...")
     @load "results/advanced_analysis.jld2" results_all raw_data stability_report
+    
+    validation_report, problematic_combinations, recommended_ranges = 
+        validate_biological_consistency(results_all, raw_data)
+    
+    # RECALCULATE results from raw_data to fix any metric bugs
+    # println("\nRecalculating metrics from raw data...")
+    # results_all = recalculate_results_from_raw_data(raw_data, ip3_range)
+    
+    # Save updated results
+    # @save "results/advanced_analysis.jld2" results_all raw_data stability_report
+    # println("Saved recalculated results to results/advanced_analysis.jld2")
+    
+    verify_atp_adp_ratio_computation()
 else
     println("\nRunning comprehensive analysis (this may take a while)...")
     results_all, raw_data, stability_report = run_comprehensive_analysis(
